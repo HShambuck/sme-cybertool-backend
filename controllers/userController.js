@@ -1,4 +1,4 @@
-const asyncHandler = require("express-async-handler"); // npm install express-async-handler
+const asyncHandler = require("express-async-handler");
 const User = require("../models/User");
 const generateToken = require("../utils/generateToken");
 
@@ -9,7 +9,6 @@ const registerUser = asyncHandler(async (req, res) => {
   const { email, password, companyName, contactPerson } = req.body;
 
   const userExists = await User.findOne({ email });
-
   if (userExists) {
     res.status(400);
     throw new Error("User already exists");
@@ -17,16 +16,13 @@ const registerUser = asyncHandler(async (req, res) => {
 
   const user = await User.create({
     email,
-    password, // Password hashing happens in pre-save hook in model
+    password,
     companyName,
     contactPerson,
   });
 
   if (user) {
     res.status(201).json({
-      _id: user._id,
-      email: user.email,
-      companyName: user.companyName,
       token: generateToken(user._id),
     });
   } else {
@@ -44,12 +40,10 @@ const authUser = asyncHandler(async (req, res) => {
   const user = await User.findOne({ email });
 
   if (user && (await user.matchPassword(password))) {
-    user.lastLogin = new Date(); // Update last login
+    user.lastLogin = new Date();
     await user.save();
+
     res.json({
-      _id: user._id,
-      email: user.email,
-      companyName: user.companyName,
       token: generateToken(user._id),
     });
   } else {
@@ -65,7 +59,13 @@ const getUserProfile = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user._id).select("-password");
 
   if (user) {
-    res.json(user);
+    res.json({
+      _id: user._id,
+      email: user.email,
+      companyName: user.companyName,
+      contactPerson: user.contactPerson,
+      avatar: user.avatar || null,
+    });
   } else {
     res.status(404);
     throw new Error("User not found");

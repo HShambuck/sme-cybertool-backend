@@ -14,6 +14,7 @@ const threatUpdateSchema = new mongoose.Schema({
     type: String,
     enum: ["info", "low", "warning", "high", "critical"],
     required: true,
+    default: "info"
   },
   category: {
     type: String,
@@ -26,6 +27,7 @@ const threatUpdateSchema = new mongoose.Schema({
       "policy",
       "general",
     ],
+    default: "general"
   },
   source: String,
   publishedAt: {
