@@ -31,17 +31,25 @@ const recommendationSchema = new mongoose.Schema({
   category: {
     type: String,
     enum: [
-      "training",
       "security_measure",
       "data_protection",
-      "policy",
       "technical",
+      "training",
+      "policy",
+      "physical_security",
+      "device_security",
+      "vendor",
     ],
+    required: true,
   },
   createdAt: {
     type: Date,
     default: Date.now,
   },
 });
+
+// Add index for faster queries
+recommendationSchema.index({ assessmentId: 1, status: 1 });
+recommendationSchema.index({ category: 1 });
 
 module.exports = mongoose.model("Recommendation", recommendationSchema);
