@@ -7,6 +7,7 @@ const dashboardRoutes = require("../routes/dashboardRoutes");
 const assessmentRoutes = require("../routes/assessmentRoutes");
 const trainingRoutes = require("../routes/trainingRoutes");
 const threatRoutes = require("../routes/threatRoutes");
+const securityRoutes = require("../routes/securityRoutes");
 
 dotenv.config();
 connectDB();
@@ -35,6 +36,7 @@ app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/assessments", assessmentRoutes);
 app.use("/api/training", trainingRoutes);
 app.use("/api/threats", threatRoutes);
+app.use("/api/security", securityRoutes);
 
 // Basic health check route
 app.get('/api/health', (req, res) => {
