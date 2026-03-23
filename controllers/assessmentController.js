@@ -33,12 +33,12 @@ const calculateRiskScore = (questionsAnswered) => {
   };
 };
 
-// --- HELPER: AI scoring via Grok (xAI) ---
+// --- HELPER: AI scoring via Groq (xAI) ---
 const aiScoreAssessment = async (questionsAnswered) => {
   try {
-    // FIXED: Changed from XAI_API_KEY to GROK_API_KEY
-    if (!process.env.GROK_API_KEY) {
-      console.error("❌ GROK_API_KEY not found in environment variables");
+    // FIXED: Changed from XAI_API_KEY to GROQ_API_KEY
+    if (!process.env.GROQ_API_KEY) {
+      console.error("❌ GROQ_API_KEY not found in environment variables");
       return null;
     }
 
@@ -51,12 +51,12 @@ const aiScoreAssessment = async (questionsAnswered) => {
       )
       .join("\n\n");
 
-    console.log("🤖 Sending to Grok API...");
+    console.log("🤖 Sending to Groq API...");
 
     const response = await axios.post(
-      "https://api.x.ai/v1/chat/completions", // Grok API endpoint
+      "https://api.x.ai/v1/chat/completions", // Groq API endpoint
       {
-        model: process.env.GROK_MODEL, // Updated to latest Grok model
+        model: process.env.GROQ_MODEL || "openai/gpt-oss-120b", // Updated to latest Groq model
         messages: [
           {
             role: "system",
@@ -86,20 +86,20 @@ Keep the explanation conversational and personalized.`,
       },
       {
         headers: {
-          // FIXED: Changed from XAI_API_KEY to GROK_API_KEY
-          Authorization: `Bearer ${process.env.GROK_API_KEY}`,
+          // FIXED: Changed from XAI_API_KEY to GROQ_API_KEY
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
           "Content-Type": "application/json",
         },
         timeout: 20000,
       },
     );
 
-    console.log("✅ Grok API response received");
+    console.log("✅ Groq API response received");
 
     const content = response.data?.choices?.[0]?.message?.content;
 
     if (!content) {
-      console.error("❌ No content in Grok response");
+      console.error("❌ No content in Groq response");
       return null;
     }
 
@@ -133,17 +133,17 @@ Keep the explanation conversational and personalized.`,
     return aiResult;
   } catch (err) {
     if (err.code === "ECONNABORTED") {
-      console.error("⏱️ Grok API request timeout");
+      console.error("⏱️ Groq API request timeout");
     } else if (err.response) {
       console.error(
-        "❌ Grok API error:",
+        "❌ Groq API error:",
         err.response.status,
         err.response.data,
       );
     } else if (err.request) {
-      console.error("❌ No response from Grok API");
+      console.error("❌ No response from Groq API");
     } else {
-      console.error("❌ Grok API error:", err.message);
+      console.error("❌ Groq API error:", err.message);
     }
     return null;
   }
