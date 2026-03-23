@@ -56,7 +56,7 @@ const aiScoreAssessment = async (questionsAnswered) => {
     const response = await axios.post(
       "https://api.x.ai/v1/chat/completions", // Grok API endpoint
       {
-        model: "grok-beta", // Updated to latest Grok model
+        model: process.env.GROK_MODEL, // Updated to latest Grok model
         messages: [
           {
             role: "system",
