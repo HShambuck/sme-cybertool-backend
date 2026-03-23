@@ -54,7 +54,7 @@ const aiScoreAssessment = async (questionsAnswered) => {
     console.log("🤖 Sending to Groq API...");
 
     const response = await axios.post(
-      "https://api.x.ai/v1/chat/completions", // Groq API endpoint
+      "https://api.groq.com/openai/v1/chat/completions", // Groq API endpoint
       {
         model: process.env.GROQ_MODEL || "openai/gpt-oss-120b", // Updated to latest Groq model
         messages: [
@@ -82,7 +82,8 @@ Keep the explanation conversational and personalized.`,
           },
         ],
         temperature: 0.5,
-        max_tokens: 600,
+        max_completion_tokens: 8192,
+        top_p: 1,
       },
       {
         headers: {
