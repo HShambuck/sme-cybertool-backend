@@ -1,3 +1,4 @@
+// backend/src/controllers/assessmentController.js
 const asyncHandler = require("express-async-handler");
 const Assessment = require("../models/Assessment");
 const Recommendation = require("../models/Recommendations");
@@ -7,7 +8,7 @@ const axios = require("axios");
 const calculateRiskScore = (questionsAnswered) => {
   const totalScore = questionsAnswered.reduce(
     (sum, q) => sum + (q.scoreImpact || 0),
-    0
+    0,
   );
 
   // Maximum possible score (35 questions * 5 points max = 175)
@@ -32,31 +33,30 @@ const calculateRiskScore = (questionsAnswered) => {
   };
 };
 
-// --- HELPER: AI scoring via OpenRouter ---
+// --- HELPER: AI scoring via Grok (xAI) ---
 const aiScoreAssessment = async (questionsAnswered) => {
   try {
-    // Check if API key exists
-    if (!process.env.OPENROUTER_API_KEY) {
-      console.error("❌ OPENROUTER_API_KEY not found in environment variables");
+    // FIXED: Changed from XAI_API_KEY to GROK_API_KEY
+    if (!process.env.GROK_API_KEY) {
+      console.error("❌ GROK_API_KEY not found in environment variables");
       return null;
     }
 
-    // Format questions for AI analysis
     const responseText = questionsAnswered
       .map(
         (q) =>
           `Question ${q.questionId}: ${q.question || "N/A"}\nAnswer: ${
             q.answer
-          }\nScore Impact: ${q.scoreImpact}`
+          }\nScore Impact: ${q.scoreImpact}`,
       )
       .join("\n\n");
 
-    console.log("🤖 Sending to OpenRouter...");
+    console.log("🤖 Sending to Grok API...");
 
     const response = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
+      "https://api.x.ai/v1/chat/completions", // Grok API endpoint
       {
-        model: "meta-llama/llama-3.3-70b-instruct:free", // Using Grok which works reliably
+        model: "grok-beta", // Updated to latest Grok model
         messages: [
           {
             role: "system",
@@ -86,34 +86,29 @@ Keep the explanation conversational and personalized.`,
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          // FIXED: Changed from XAI_API_KEY to GROK_API_KEY
+          Authorization: `Bearer ${process.env.GROK_API_KEY}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": process.env.APP_URL || "http://localhost:3000",
-          "X-Title": "SME Security Assessment Tool",
         },
         timeout: 20000,
-      }
+      },
     );
 
-    console.log("✅ OpenRouter response received");
+    console.log("✅ Grok API response received");
 
-    // Extract response content
     const content = response.data?.choices?.[0]?.message?.content;
 
     if (!content) {
-      console.error("❌ No content in OpenRouter response");
+      console.error("❌ No content in Grok response");
       return null;
     }
 
     console.log("📄 Raw AI response:", content);
 
-    // Parse JSON response
     let aiResult;
     try {
-      // Try direct JSON parse
       aiResult = JSON.parse(content);
     } catch (parseError) {
-      // Try to extract JSON from markdown code blocks or text
       const jsonMatch = content.match(/\{[\s\S]*?\}/);
       if (jsonMatch) {
         aiResult = JSON.parse(jsonMatch[0]);
@@ -123,7 +118,6 @@ Keep the explanation conversational and personalized.`,
       }
     }
 
-    // Validate response structure
     if (
       !aiResult.score ||
       !aiResult.level ||
@@ -133,30 +127,29 @@ Keep the explanation conversational and personalized.`,
       return null;
     }
 
-    // Ensure score is a number between 0-100
     aiResult.score = Math.min(100, Math.max(0, parseInt(aiResult.score)));
 
     console.log("✅ AI scoring successful:", aiResult);
     return aiResult;
   } catch (err) {
     if (err.code === "ECONNABORTED") {
-      console.error("⏱️ OpenRouter request timeout");
+      console.error("⏱️ Grok API request timeout");
     } else if (err.response) {
       console.error(
-        "❌ OpenRouter API error:",
+        "❌ Grok API error:",
         err.response.status,
-        err.response.data
+        err.response.data,
       );
     } else if (err.request) {
-      console.error("❌ No response from OpenRouter");
+      console.error("❌ No response from Grok API");
     } else {
-      console.error("❌ OpenRouter error:", err.message);
+      console.error("❌ Grok API error:", err.message);
     }
     return null;
   }
 };
 
-// --- HELPER: Category mapping (FIXED) ---
+// --- HELPER: Category mapping ---
 const getCategoryFromQuestionId = (questionId) => {
   const num = parseInt(questionId.replace("q", ""));
 
@@ -190,7 +183,7 @@ const getCategoryFromQuestionId = (questionId) => {
   // Questions 34-35: Vendor Management
   if (num >= 34 && num <= 35) return "vendor";
 
-  // Default fallback (use a valid enum value)
+  // Default fallback
   return "policy";
 };
 
@@ -254,7 +247,7 @@ const generateRecommendations = async (questionsAnswered, assessmentId) => {
   try {
     const createdRecs = await Recommendation.insertMany(recDocs);
     console.log(
-      `✅ Successfully created ${createdRecs.length} recommendations`
+      `✅ Successfully created ${createdRecs.length} recommendations`,
     );
     return createdRecs.map((r) => r._id);
   } catch (error) {
@@ -306,9 +299,10 @@ const createAssessment = asyncHandler(async (req, res) => {
       aiResult.explanation === "Manual scoring applied based on answer weights."
         ? "manual"
         : "ai",
+    // FIXED: Updated AI model name to Grok
     aiModel:
       aiResult.explanation !== "Manual scoring applied based on answer weights."
-        ? "meta-llama/llama-3.3-8b-instruct:free"
+        ? "grok-beta"
         : undefined,
   });
 
@@ -331,12 +325,12 @@ const createAssessment = asyncHandler(async (req, res) => {
   console.log("🔄 Populating recommendations...");
   const populatedAssessment = await Assessment.findById(assessment._id)
     .populate("recommendationIds")
-    .lean(); // Use lean() to get plain JS object
+    .lean();
   console.log("✅ Recommendations populated");
 
   console.log("📤 Sending response to frontend");
 
-  // Send response with lean object to avoid circular refs
+  // Send response
   const responseData = {
     message: "Assessment created successfully",
     assessment: {
@@ -391,7 +385,7 @@ const getAllAssessments = asyncHandler(async (req, res) => {
 // --- GET BY ID ---
 const getAssessmentById = asyncHandler(async (req, res) => {
   const assessment = await Assessment.findById(req.params.id).populate(
-    "recommendationIds"
+    "recommendationIds",
   );
 
   if (!assessment) {
