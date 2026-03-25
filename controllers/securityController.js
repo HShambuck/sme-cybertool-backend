@@ -1,700 +1,1030 @@
 const axios = require("axios");
 const WebsiteScan = require("../models/WebsiteScan");
 
-// Validate URL format
-const validateUrl = (url) => {
+// ════════════════════════════════════════════════════════════
+// UTILITY: Validate URL and extract domain
+// ════════════════════════════════════════════════════════════
+const validateUrl = (rawUrl) => {
   try {
-    const urlObj = new URL(url);
-    return urlObj.hostname;
-  } catch (error) {
+    const u = new URL(rawUrl);
+    if (!["http:", "https:"].includes(u.protocol)) return null;
+    return u.hostname;
+  } catch {
     return null;
   }
 };
 
-// Check SSL/TLS using SSL Labs API
-const checkSSL = async (domain) => {
+// ════════════════════════════════════════════════════════════
+// LAYER 0: Reachability — blocks fake/dead URLs immediately
+// ════════════════════════════════════════════════════════════
+const checkUrlReachable = async (url) => {
   try {
-    const response = await axios.get(
-      `https://api.ssllabs.com/api/v3/analyze?host=${domain}&publish=off&all=done&fromCache=on`,
-      { timeout: 30000 }
-    );
-
-    if (response.data.status === "READY" && response.data.endpoints) {
-      const grade = response.data.endpoints[0]?.grade || "N/A";
-      return grade;
-    }
-
-    // If not cached, return a simulated grade for demo
-    return "A";
-  } catch (error) {
-    console.error("SSL check error:", error.message);
-    return "N/A";
+    const res = await axios.get(url, {
+      timeout: 8000,
+      maxRedirects: 5,
+      validateStatus: (s) => s < 600,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; CyberShield-Scanner/1.0)",
+      },
+    });
+    return {
+      reachable: true,
+      statusCode: res.status,
+      headers: res.headers,
+      finalUrl: res.request?.res?.responseUrl || url,
+      rawBody: typeof res.data === "string" ? res.data.substring(0, 50000) : "",
+    };
+  } catch (err) {
+    const reason =
+      err.code === "ENOTFOUND"
+        ? "Domain does not exist (DNS lookup failed)"
+        : err.code === "ECONNREFUSED"
+          ? "Connection refused — server not running"
+          : err.code === "ECONNABORTED" || err.code === "ETIMEDOUT"
+            ? "Connection timed out"
+            : `Cannot reach URL: ${err.message}`;
+    return { reachable: false, reason };
   }
 };
 
-// Check security headers
-const checkSecurityHeaders = async (url) => {
-  try {
-    const response = await axios.get(url, {
-      timeout: 10000,
-      maxRedirects: 5,
-      validateStatus: () => true,
+// ════════════════════════════════════════════════════════════
+// LAYER 1A: Transport Security
+// ════════════════════════════════════════════════════════════
+const checkTransportSecurity = async (url, domain, responseHeaders) => {
+  const findings = [];
+  const isHttps = url.startsWith("https://");
+
+  if (!isHttps) {
+    findings.push({
+      id: "TRANSPORT_001",
+      category: "Transport Security",
+      type: "confirmed",
+      title: "Site Not Using HTTPS",
+      severity: "critical",
+      confidence: "high",
+      evidence: `URL uses HTTP: ${url}`,
+      owasp: "A02:2021 – Cryptographic Failures",
+      cwe: "CWE-319",
+      description:
+        "All traffic between users and your server is transmitted unencrypted.",
+      recommendation:
+        "Install a TLS certificate and redirect all HTTP traffic to HTTPS. Use Let's Encrypt for a free certificate.",
     });
 
-    const headers = response.headers;
-    const securityHeaders = [];
-    const missingHeaders = [];
+    try {
+      const httpCheck = await axios.get(`http://${domain}`, {
+        timeout: 5000,
+        maxRedirects: 0,
+        validateStatus: () => true,
+      });
+      if (![301, 302, 307, 308].includes(httpCheck.status)) {
+        findings.push({
+          id: "TRANSPORT_002",
+          category: "Transport Security",
+          type: "confirmed",
+          title: "No HTTP to HTTPS Redirect",
+          severity: "high",
+          confidence: "high",
+          evidence: `HTTP responded with status ${httpCheck.status} instead of a redirect`,
+          owasp: "A02:2021 – Cryptographic Failures",
+          cwe: "CWE-319",
+          description:
+            "Users who visit the HTTP version are not automatically redirected to HTTPS.",
+          recommendation:
+            "Configure a permanent 301 redirect from HTTP to HTTPS at the server or CDN level.",
+        });
+      }
+    } catch {
+      /* ignore */
+    }
+  }
 
-    // Check for important security headers
-    const headerChecks = {
-      "strict-transport-security": "Strict-Transport-Security",
-      "x-frame-options": "X-Frame-Options",
-      "x-content-type-options": "X-Content-Type-Options",
-      "content-security-policy": "Content-Security-Policy",
-      "x-xss-protection": "X-XSS-Protection",
-      "referrer-policy": "Referrer-Policy",
-    };
-
-    for (const [key, displayName] of Object.entries(headerChecks)) {
-      if (headers[key]) {
-        securityHeaders.push(displayName);
-      } else {
-        missingHeaders.push(`Missing ${displayName}`);
+  let sslGrade = "N/A";
+  let hasSSL = isHttps;
+  try {
+    const sslRes = await axios.get(
+      `https://api.ssllabs.com/api/v3/analyze?host=${domain}&publish=off&fromCache=on&all=done`,
+      { timeout: 15000 },
+    );
+    if (sslRes.data.status === "READY" && sslRes.data.endpoints?.length) {
+      sslGrade = sslRes.data.endpoints[0]?.grade || "T";
+      hasSSL = true;
+      if (["C", "D", "F", "T"].includes(sslGrade)) {
+        findings.push({
+          id: "TRANSPORT_003",
+          category: "Transport Security",
+          type: "confirmed",
+          title: `Weak SSL/TLS Configuration (Grade ${sslGrade})`,
+          severity: sslGrade === "F" || sslGrade === "T" ? "critical" : "high",
+          confidence: "high",
+          evidence: `SSL Labs returned grade: ${sslGrade}`,
+          owasp: "A02:2021 – Cryptographic Failures",
+          cwe: "CWE-326",
+          description:
+            "Your SSL/TLS configuration uses outdated protocols or weak cipher suites.",
+          recommendation:
+            "Disable TLS 1.0 and 1.1. Enable TLS 1.3. Remove weak cipher suites.",
+        });
       }
     }
+  } catch {
+    /* SSL Labs unavailable */
+  }
 
-    return { present: securityHeaders, missing: missingHeaders };
-  } catch (error) {
-    console.error("Headers check error:", error.message);
+  return { findings, sslGrade, hasSSL };
+};
+
+// ════════════════════════════════════════════════════════════
+// LAYER 1B: Security Headers — 7 headers checked
+// ════════════════════════════════════════════════════════════
+const checkSecurityHeaders = (responseHeaders = {}) => {
+  const findings = [];
+  const presentHeaders = [];
+
+  const headerChecks = [
+    {
+      key: "strict-transport-security",
+      label: "Strict-Transport-Security (HSTS)",
+      id: "HEADER_001",
+      severity: "high",
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-319",
+      description:
+        "HSTS is missing. Browsers may connect over HTTP, enabling SSL stripping attacks.",
+      recommendation:
+        "Add: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+    },
+    {
+      key: "content-security-policy",
+      label: "Content-Security-Policy (CSP)",
+      id: "HEADER_002",
+      severity: "high",
+      owasp: "A03:2021 – Injection",
+      cwe: "CWE-693",
+      description:
+        "No CSP header found. Your site has no defence against XSS and data injection attacks.",
+      recommendation:
+        "Define a Content-Security-Policy. Start with: default-src 'self'.",
+    },
+    {
+      key: "x-frame-options",
+      label: "X-Frame-Options",
+      id: "HEADER_003",
+      severity: "high",
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-1021",
+      description:
+        "X-Frame-Options is missing. Your site can be embedded in iframes, enabling clickjacking.",
+      recommendation: "Add: X-Frame-Options: DENY",
+    },
+    {
+      key: "x-content-type-options",
+      label: "X-Content-Type-Options",
+      id: "HEADER_004",
+      severity: "medium",
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-430",
+      description:
+        "Missing X-Content-Type-Options allows MIME-type sniffing attacks.",
+      recommendation: "Add: X-Content-Type-Options: nosniff",
+    },
+    {
+      key: "referrer-policy",
+      label: "Referrer-Policy",
+      id: "HEADER_005",
+      severity: "low",
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-116",
+      description:
+        "No Referrer-Policy set. Sensitive URL paths may leak to external sites.",
+      recommendation: "Add: Referrer-Policy: strict-origin-when-cross-origin",
+    },
+    {
+      key: "permissions-policy",
+      label: "Permissions-Policy",
+      id: "HEADER_006",
+      severity: "low",
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-693",
+      description:
+        "No Permissions-Policy header. Browser features like camera/mic are unrestricted.",
+      recommendation:
+        "Add: Permissions-Policy: geolocation=(), microphone=(), camera=()",
+    },
+    {
+      key: "x-xss-protection",
+      label: "X-XSS-Protection",
+      id: "HEADER_007",
+      severity: "low",
+      owasp: "A03:2021 – Injection",
+      cwe: "CWE-693",
+      description:
+        "X-XSS-Protection not set. Older browsers miss an extra XSS filter layer.",
+      recommendation: "Add: X-XSS-Protection: 1; mode=block",
+    },
+  ];
+
+  for (const check of headerChecks) {
+    if (responseHeaders[check.key]) {
+      presentHeaders.push(check.label);
+    } else {
+      findings.push({
+        id: check.id,
+        category: "Header Security",
+        type: "confirmed",
+        title: `Missing ${check.label}`,
+        severity: check.severity,
+        confidence: "high",
+        evidence: `Header '${check.key}' not present in HTTP response`,
+        owasp: check.owasp,
+        cwe: check.cwe,
+        description: check.description,
+        recommendation: check.recommendation,
+      });
+    }
+  }
+
+  return {
+    findings,
+    presentHeaders,
+    missingHeaders: findings.map((f) => f.title),
+  };
+};
+
+// ════════════════════════════════════════════════════════════
+// LAYER 1C: Cookie Security
+// ════════════════════════════════════════════════════════════
+const checkCookieSecurity = (responseHeaders = {}) => {
+  const findings = [];
+  const raw = responseHeaders["set-cookie"];
+  if (!raw) return { findings };
+  const cookies = Array.isArray(raw) ? raw : [raw];
+
+  for (const cookie of cookies) {
+    const name = cookie.split("=")[0].trim();
+    const lower = cookie.toLowerCase();
+
+    if (!lower.includes("httponly")) {
+      findings.push({
+        id: "COOKIE_001",
+        category: "Application Security",
+        type: "confirmed",
+        title: `Cookie '${name}' Missing HttpOnly Flag`,
+        severity: "medium",
+        confidence: "high",
+        evidence: `Set-Cookie: ${cookie.substring(0, 80)}`,
+        owasp: "A05:2021 – Security Misconfiguration",
+        cwe: "CWE-1004",
+        description: `The cookie '${name}' is accessible via JavaScript. XSS attacks could steal session tokens.`,
+        recommendation:
+          "Add the HttpOnly flag to all session and authentication cookies.",
+      });
+    }
+    if (!lower.includes("secure")) {
+      findings.push({
+        id: "COOKIE_002",
+        category: "Application Security",
+        type: "confirmed",
+        title: `Cookie '${name}' Missing Secure Flag`,
+        severity: "medium",
+        confidence: "high",
+        evidence: `Set-Cookie: ${cookie.substring(0, 80)}`,
+        owasp: "A02:2021 – Cryptographic Failures",
+        cwe: "CWE-614",
+        description: `Cookie '${name}' can be transmitted over unencrypted HTTP connections.`,
+        recommendation:
+          "Add the Secure flag to ensure cookies are only sent over HTTPS.",
+      });
+    }
+    if (!lower.includes("samesite")) {
+      findings.push({
+        id: "COOKIE_003",
+        category: "Application Security",
+        type: "posture",
+        title: `Cookie '${name}' Missing SameSite Attribute`,
+        severity: "low",
+        confidence: "high",
+        evidence: `Set-Cookie: ${cookie.substring(0, 80)}`,
+        owasp: "A01:2021 – Broken Access Control",
+        cwe: "CWE-352",
+        description: `Cookie '${name}' has no SameSite attribute, increasing CSRF risk.`,
+        recommendation:
+          "Set SameSite=Strict or SameSite=Lax depending on your requirements.",
+      });
+    }
+  }
+
+  return { findings };
+};
+
+// ════════════════════════════════════════════════════════════
+// LAYER 2: Technology Fingerprinting + CVE mapping
+// ════════════════════════════════════════════════════════════
+const fingerprintTechnology = (responseHeaders = {}, htmlBody = "") => {
+  const detectedTech = [];
+  const findings = [];
+
+  const server = responseHeaders["server"] || "";
+  const poweredBy = responseHeaders["x-powered-by"] || "";
+
+  if (server && server.toLowerCase() !== "cloudflare" && server.length > 2) {
+    detectedTech.push({ name: "Server", version: server });
+    findings.push({
+      id: "TECH_001",
+      category: "Infrastructure Exposure",
+      type: "posture",
+      title: "Server Version Disclosed in Headers",
+      severity: "low",
+      confidence: "high",
+      evidence: `Server: ${server}`,
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-200",
+      description:
+        "Your server discloses its software name and version, aiding attackers in targeting known vulnerabilities.",
+      recommendation:
+        "Suppress the Server header or replace it with a generic value.",
+    });
+  }
+
+  if (poweredBy) {
+    detectedTech.push({ name: "Backend", version: poweredBy });
+    findings.push({
+      id: "TECH_002",
+      category: "Infrastructure Exposure",
+      type: "posture",
+      title: "Backend Technology Disclosed (X-Powered-By)",
+      severity: "low",
+      confidence: "high",
+      evidence: `X-Powered-By: ${poweredBy}`,
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-200",
+      description:
+        "The X-Powered-By header reveals your backend language/framework.",
+      recommendation:
+        "Remove the X-Powered-By header in your server configuration.",
+    });
+  }
+
+  if (htmlBody.includes("/wp-content/") || htmlBody.includes("/wp-includes/")) {
+    const wpVersion = htmlBody.match(/WordPress\s+([\d.]+)/i)?.[1];
+    detectedTech.push({ name: "WordPress", version: wpVersion || "Unknown" });
+    findings.push({
+      id: "TECH_003",
+      category: "Technology Risk",
+      type: wpVersion ? "confirmed" : "posture",
+      title: wpVersion
+        ? `WordPress ${wpVersion} Detected`
+        : "WordPress CMS Detected",
+      severity: wpVersion ? "medium" : "low",
+      confidence: "high",
+      evidence: wpVersion
+        ? `WordPress version ${wpVersion} in page source`
+        : "wp-content/wp-includes paths found",
+      owasp: "A06:2021 – Vulnerable and Outdated Components",
+      cwe: "CWE-1035",
+      description: wpVersion
+        ? `WordPress ${wpVersion} is publicly visible. Outdated versions have known CVEs.`
+        : "WordPress CMS detected. Ensure it is regularly updated.",
+      recommendation: wpVersion
+        ? "Update WordPress to the latest version and remove the generator meta tag."
+        : "Enable automatic updates and audit all active plugins.",
+    });
+  }
+
+  const jqMatch = htmlBody.match(/jquery[.-]([\d.]+)(\.min)?\.js/i);
+  if (jqMatch) {
+    const jqv = jqMatch[1];
+    detectedTech.push({ name: "jQuery", version: jqv });
+    const [major, minor] = jqv.split(".").map(Number);
+    if (major < 3 || (major === 3 && minor < 5)) {
+      findings.push({
+        id: "TECH_004",
+        category: "Technology Risk",
+        type: "confirmed",
+        title: `Outdated jQuery ${jqv} — Known XSS CVEs`,
+        severity: "medium",
+        confidence: "high",
+        evidence: `jquery-${jqv}.min.js loaded in page`,
+        owasp: "A06:2021 – Vulnerable and Outdated Components",
+        cwe: "CWE-1035",
+        cveSample: "CVE-2020-11022, CVE-2020-11023",
+        description: `jQuery ${jqv} has known XSS vulnerabilities. Version 3.5+ is required.`,
+        recommendation: "Upgrade jQuery to 3.7.x or later.",
+      });
+    }
+  }
+
+  const phpVersion = poweredBy.match(/php\/([\d.]+)/i)?.[1];
+  if (phpVersion) {
+    detectedTech.push({ name: "PHP", version: phpVersion });
+    const [major] = phpVersion.split(".").map(Number);
+    if (major < 8) {
+      findings.push({
+        id: "TECH_005",
+        category: "Technology Risk",
+        type: "confirmed",
+        title: `End-of-Life PHP ${phpVersion} Detected`,
+        severity: "high",
+        confidence: "high",
+        evidence: `X-Powered-By: PHP/${phpVersion}`,
+        owasp: "A06:2021 – Vulnerable and Outdated Components",
+        cwe: "CWE-1035",
+        description: `PHP ${phpVersion} is end-of-life and receives no security patches.`,
+        recommendation: "Upgrade to PHP 8.2 or later immediately.",
+      });
+    }
+  }
+
+  if (htmlBody.includes("Index of /.git") || htmlBody.includes("[DIR] .git")) {
+    findings.push({
+      id: "TECH_006",
+      category: "Infrastructure Exposure",
+      type: "confirmed",
+      title: "Exposed .git Directory",
+      severity: "critical",
+      confidence: "high",
+      evidence: "Directory listing of .git found in page response",
+      owasp: "A05:2021 – Security Misconfiguration",
+      cwe: "CWE-548",
+      description:
+        "Your .git directory is publicly accessible — attackers can download your full source code and secrets.",
+      recommendation:
+        "Block .git access in your server config immediately and rotate any exposed credentials.",
+    });
+  }
+
+  return { findings, detectedTech };
+};
+
+// ════════════════════════════════════════════════════════════
+// LAYER 3: CORS Misconfiguration
+// ════════════════════════════════════════════════════════════
+const checkCORS = async (url) => {
+  const findings = [];
+  try {
+    const res = await axios.get(url, {
+      timeout: 5000,
+      validateStatus: () => true,
+      headers: {
+        Origin: "https://evil-attacker.com",
+        "User-Agent": "Mozilla/5.0 (compatible; CyberShield-Scanner/1.0)",
+      },
+    });
+
+    const acao = res.headers["access-control-allow-origin"];
+    const acac = res.headers["access-control-allow-credentials"];
+
+    if (acao === "*") {
+      findings.push({
+        id: "CORS_001",
+        category: "Application Security",
+        type: "probable",
+        title: "Wildcard CORS Policy (*)",
+        severity: "medium",
+        confidence: "high",
+        evidence: "Access-Control-Allow-Origin: *",
+        owasp: "A05:2021 – Security Misconfiguration",
+        cwe: "CWE-942",
+        description:
+          "Your CORS policy allows any website to make cross-origin requests.",
+        recommendation: "Restrict CORS to specific trusted origins.",
+      });
+    } else if (acao === "https://evil-attacker.com") {
+      findings.push({
+        id: "CORS_002",
+        category: "Application Security",
+        type: "confirmed",
+        title: "CORS Policy Reflects Arbitrary Origins",
+        severity: "high",
+        confidence: "high",
+        evidence: `ACAO: ${acao} (reflected test origin)`,
+        owasp: "A05:2021 – Security Misconfiguration",
+        cwe: "CWE-942",
+        description:
+          "Your server reflects any Origin header back without validation.",
+        recommendation: "Maintain an explicit allowlist of trusted origins.",
+      });
+
+      if (acac === "true") {
+        findings.push({
+          id: "CORS_003",
+          category: "Application Security",
+          type: "confirmed",
+          title: "Critical: CORS Reflects Origin + Allows Credentials",
+          severity: "critical",
+          confidence: "high",
+          evidence: `ACAO: ${acao} + ACAC: true`,
+          owasp: "A01:2021 – Broken Access Control",
+          cwe: "CWE-942",
+          description:
+            "Attackers can make fully authenticated requests on behalf of logged-in users from any domain.",
+          recommendation:
+            "Immediately restrict allowed origins and remove allow-credentials for untrusted origins.",
+        });
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return { findings };
+};
+
+// ════════════════════════════════════════════════════════════
+// LAYER 4A: Google Safe Browsing
+// ════════════════════════════════════════════════════════════
+const checkGoogleSafeBrowsing = async (url) => {
+  const apiKey = process.env.GOOGLE_SAFE_BROWSING_API_KEY;
+  if (!apiKey) return { safe: true, threats: [], source: "skipped" };
+
+  try {
+    const res = await axios.post(
+      `https://safebrowsing.googleapis.com/v4/threatMatches:find?key=${apiKey}`,
+      {
+        client: { clientId: "cybershield-sme", clientVersion: "1.0.0" },
+        threatInfo: {
+          threatTypes: [
+            "MALWARE",
+            "SOCIAL_ENGINEERING",
+            "UNWANTED_SOFTWARE",
+            "POTENTIALLY_HARMFUL_APPLICATION",
+          ],
+          platformTypes: ["ANY_PLATFORM"],
+          threatEntryTypes: ["URL"],
+          threatEntries: [{ url }],
+        },
+      },
+      { timeout: 5000 },
+    );
+
+    const matches = res.data.matches || [];
+    return matches.length
+      ? {
+          safe: false,
+          threats: matches.map((m) => m.threatType),
+          source: "google_safe_browsing",
+        }
+      : { safe: true, threats: [], source: "google_safe_browsing" };
+  } catch (err) {
+    console.error("Google Safe Browsing error:", err.message);
+    return { safe: true, threats: [], source: "gsb_error" };
+  }
+};
+
+// ════════════════════════════════════════════════════════════
+// LAYER 4B: URLScan.io
+// ════════════════════════════════════════════════════════════
+const checkUrlScan = async (url) => {
+  const apiKey = process.env.URLSCAN_API_KEY;
+  if (!apiKey)
+    return { verdict: "unknown", malicious: false, source: "skipped" };
+
+  try {
+    const submit = await axios.post(
+      "https://urlscan.io/api/v1/scan/",
+      { url, visibility: "private" },
+      {
+        headers: { "API-Key": apiKey, "Content-Type": "application/json" },
+        timeout: 10000,
+      },
+    );
+    const uuid = submit.data.uuid;
+    if (!uuid)
+      return {
+        verdict: "unknown",
+        malicious: false,
+        source: "urlscan_no_uuid",
+      };
+
+    await new Promise((r) => setTimeout(r, 12000));
+
+    const result = await axios.get(
+      `https://urlscan.io/api/v1/result/${uuid}/`,
+      { timeout: 10000 },
+    );
+    const v = result.data.verdicts?.overall;
     return {
-      present: [],
-      missing: [
-        "Missing Strict-Transport-Security",
-        "Missing X-Frame-Options",
-        "Missing X-Content-Type-Options",
-        "Missing Content-Security-Policy",
-        "Missing X-XSS-Protection",
-        "Missing Referrer-Policy",
-      ],
+      verdict: v?.score > 50 ? "suspicious" : "clean",
+      malicious: v?.malicious || false,
+      score: v?.score || 0,
+      source: "urlscan",
     };
+  } catch (err) {
+    console.error("URLScan error:", err.message);
+    return { verdict: "unknown", malicious: false, source: "urlscan_error" };
   }
 };
 
-// Check domain reputation (using free pattern-based detection)
-const checkDomainReputation = async (url) => {
-  try {
-    // Try to use ApiHelper if available
-    try {
-      const ApiHelper = require("../utils/apiHelpers");
-      const threatCheck = await ApiHelper.checkThreats(url);
-      return threatCheck.verdict;
-    } catch (error) {
-      console.log("ApiHelper not available, using basic checks");
-    }
-
-    // Fallback to basic pattern checks
-    const suspiciousPatterns = [
-      /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/, // IP addresses
-      /[a-z0-9-]+\.tk$|\.ml$|\.ga$|\.cf$|\.gq$/i, // Free suspicious TLDs
-      /bit\.ly|tinyurl|goo\.gl/, // URL shorteners
-    ];
-
-    for (const pattern of suspiciousPatterns) {
-      if (pattern.test(url)) {
-        return "Warning";
-      }
-    }
-
-    return "Clean";
-  } catch (error) {
-    console.error("Reputation check error:", error.message);
+// ════════════════════════════════════════════════════════════
+// LAYER 5: Reputation signals
+// ════════════════════════════════════════════════════════════
+const deriveReputation = (safeBrowsing, urlscan) => {
+  if (!safeBrowsing.safe || urlscan.malicious) return "Warning";
+  if (urlscan.verdict === "suspicious") return "Warning";
+  if (safeBrowsing.source === "skipped" && urlscan.source === "skipped")
     return "Unknown";
-  }
+  return "Clean";
 };
 
-// Breach check
-const checkBreaches = async (domain) => {
-  try {
-    // Try to use ApiHelper if available
-    try {
-      const ApiHelper = require("../utils/apiHelpers");
-      return await ApiHelper.checkBreachData(domain);
-    } catch (error) {
-      console.log("ApiHelper not available, using fallback");
-    }
-
-    // Fallback response
-    return "No breach data available";
-  } catch (error) {
-    console.error("Breach check error:", error.message);
-    return "Unable to verify breach data";
+const buildReputationFindings = (safeBrowsing, urlscan) => {
+  const findings = [];
+  if (!safeBrowsing.safe) {
+    findings.push({
+      id: "REP_001",
+      category: "Threat Reputation",
+      type: "confirmed",
+      title: `Flagged by Google Safe Browsing: ${safeBrowsing.threats.join(", ")}`,
+      severity: "critical",
+      confidence: "high",
+      evidence: `Threat types: ${safeBrowsing.threats.join(", ")}`,
+      owasp: "A09:2021 – Security Logging and Monitoring Failures",
+      cwe: "CWE-693",
+      description:
+        "Your domain is on Google's threat database. Users see browser warnings.",
+      recommendation:
+        "Use Google Search Console to request a security review after resolving flagged content.",
+    });
   }
+  if (urlscan.malicious || urlscan.verdict === "suspicious") {
+    findings.push({
+      id: "REP_002",
+      category: "Threat Reputation",
+      type: "probable",
+      title: "Suspicious Behaviour Detected by URLScan",
+      severity: "high",
+      confidence: "medium",
+      evidence: `URLScan verdict: ${urlscan.verdict}, score: ${urlscan.score}`,
+      owasp: "A09:2021 – Security Logging and Monitoring Failures",
+      cwe: "CWE-693",
+      description:
+        "URLScan flagged suspicious page behaviour or redirect patterns.",
+      recommendation:
+        "Audit all third-party scripts and remove unauthorized external resources.",
+    });
+  }
+  return { findings };
 };
 
-// --- AI-POWERED: Generate recommendations using OpenRouter ---
+// ════════════════════════════════════════════════════════════
+// SCORING ENGINE
+// Transport(20) Headers(15) AppSec(25) TechRisk(15)
+// Infra(10) Reputation(10) Config(5)
+// ════════════════════════════════════════════════════════════
+const calculateScore = (
+  allFindings,
+  sslGrade,
+  hasSSL,
+  headerData,
+  reputation,
+) => {
+  const breakdown = {
+    transportSecurity: 0,
+    headerSecurity: 0,
+    applicationSecurity: 0,
+    technologyRisk: 0,
+    infrastructureExposure: 0,
+    threatReputation: 0,
+    configurationHygiene: 0,
+  };
+
+  if (hasSSL) {
+    const pts = { "A+": 20, A: 17, "A-": 15, B: 12, C: 8, D: 4, F: 1, T: 2 };
+    breakdown.transportSecurity = pts[sslGrade] ?? 10;
+  }
+
+  breakdown.headerSecurity = Math.round(
+    (headerData.presentHeaders.length / 7) * 15,
+  );
+
+  const deduct = (findings, map) =>
+    findings.reduce((s, f) => s + (map[f.severity] || 0), 0);
+
+  breakdown.applicationSecurity = Math.max(
+    0,
+    25 -
+      deduct(
+        allFindings.filter((f) => f.category === "Application Security"),
+        { critical: 12, high: 8, medium: 4, low: 2 },
+      ),
+  );
+
+  breakdown.technologyRisk = Math.max(
+    0,
+    15 -
+      deduct(
+        allFindings.filter((f) => f.category === "Technology Risk"),
+        { critical: 8, high: 6, medium: 3, low: 1 },
+      ),
+  );
+
+  breakdown.infrastructureExposure = Math.max(
+    0,
+    10 -
+      deduct(
+        allFindings.filter((f) => f.category === "Infrastructure Exposure"),
+        { critical: 6, high: 4, medium: 2, low: 1 },
+      ),
+  );
+
+  breakdown.threatReputation =
+    reputation === "Clean" ? 10 : reputation === "Unknown" ? 5 : 0;
+
+  const postureCount = allFindings.filter((f) => f.type === "posture").length;
+  breakdown.configurationHygiene = Math.max(0, 5 - postureCount);
+
+  const total = Math.min(
+    100,
+    Math.round(Object.values(breakdown).reduce((a, b) => a + b, 0)),
+  );
+  return { total, breakdown };
+};
+
+const getSecurityLevel = (score) => {
+  if (score >= 80) return { label: "Secure", color: "green" };
+  if (score >= 60) return { label: "Moderately Secure", color: "yellow" };
+  if (score >= 40) return { label: "At Risk", color: "orange" };
+  return { label: "Highly Vulnerable", color: "red" };
+};
+
+// ════════════════════════════════════════════════════════════
+// AI RECOMMENDATIONS via Groq
+// ════════════════════════════════════════════════════════════
 const generateAIRecommendations = async (
   domain,
-  sslGrade,
-  headersMissing,
+  scoreData,
+  allFindings,
   reputation,
-  score
 ) => {
+  const apiKey = process.env.GROQ_API_KEY;
+  const model = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+  if (!apiKey) return null;
+
+  const topFindings = allFindings
+    .filter((f) => ["critical", "high"].includes(f.severity))
+    .slice(0, 8)
+    .map((f) => `[${f.severity.toUpperCase()}] ${f.title} — ${f.description}`)
+    .join("\n");
+
+  const context = `
+Domain: ${domain}
+Score: ${scoreData.total}/100 (${getSecurityLevel(scoreData.total).label})
+Breakdown: Transport ${scoreData.breakdown.transportSecurity}/20 | Headers ${scoreData.breakdown.headerSecurity}/15 | AppSec ${scoreData.breakdown.applicationSecurity}/25 | TechRisk ${scoreData.breakdown.technologyRisk}/15 | Infra ${scoreData.breakdown.infrastructureExposure}/10 | Reputation ${scoreData.breakdown.threatReputation}/10 | Config ${scoreData.breakdown.configurationHygiene}/5
+Reputation: ${reputation}
+Critical/High Findings:
+${topFindings || "None"}
+  `.trim();
+
   try {
-    // Check if API key exists
-    if (!process.env.OPENROUTER_API_KEY) {
-      console.error("❌ OPENROUTER_API_KEY not found in environment variables");
-      return null;
-    }
-
-    // Format the security analysis for AI
-    const analysisText = `
-Website: ${domain}
-Security Score: ${score}/100
-SSL/TLS Grade: ${sslGrade}
-Domain Reputation: ${reputation}
-Missing Security Headers: ${
-      headersMissing.length > 0 ? headersMissing.join(", ") : "None"
-    }
-`;
-
-    console.log("🤖 Generating AI-powered recommendations...");
-
-    const response = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
+    const res = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
       {
-        model: "meta-llama/llama-3.3-8b-instruct:free",
+        model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+        max_completion_tokens: 1800,
+        temperature: 0.6,
         messages: [
           {
             role: "system",
-            content: `You are a cybersecurity expert specializing in website security for small and medium enterprises.
-Analyze the website security assessment and provide actionable, personalized recommendations.
-
-IMPORTANT: 
-- Use second-person language (your, you, your website) to make recommendations personal and direct
-- Prioritize recommendations by severity (critical, high, medium, low)
-- Provide specific, actionable steps
-- Include brief explanation of the impact
-- Be concise and practical
-
-Return ONLY valid JSON array with this structure:
-[
-  {
-    "priority": "critical|high|medium|low",
-    "category": "SSL/TLS|Security Headers|Domain Reputation|Overall Security",
-    "title": "Short recommendation title",
-    "description": "What the issue is (personalized, use 'your')",
-    "action": "Specific step to take (personalized, use 'you' and 'your')",
-    "impact": "What this protects against or improves"
-  }
-]
-
-Generate 3-6 recommendations based on the most critical issues found.`,
+            content: `You are a concise cybersecurity expert for SMEs.
+Return ONLY a valid JSON array of 4–6 recommendations. No markdown, no preamble, no backticks.
+Each item: { priority (critical|high|medium|low), category, title, description, action, impact }
+Use second-person. Be specific and actionable.`,
           },
           {
             role: "user",
-            content: `Analyze this website security assessment and provide personalized recommendations:\n\n${analysisText}\n\nProvide actionable security recommendations in JSON format.`,
+            content: `Recommendations for this assessment:\n\n${context}`,
           },
         ],
-        temperature: 0.7,
-        max_tokens: 1500,
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": process.env.APP_URL || "http://localhost:5000",
-          "X-Title": "SME Security Analysis Tool",
         },
         timeout: 25000,
-      }
+      },
     );
 
-    console.log("✅ OpenRouter response received");
-
-    // Extract response content
-    const content = response.data?.choices?.[0]?.message?.content;
-
-    if (!content) {
-      console.error("❌ No content in OpenRouter response");
-      return null;
-    }
-
-    console.log("📄 Raw AI response:", content.substring(0, 200) + "...");
-
-    // Parse JSON response
-    let aiResult;
-    try {
-      // Try direct JSON parse
-      aiResult = JSON.parse(content);
-    } catch (parseError) {
-      // Try to extract JSON array from markdown code blocks or text
-      const jsonMatch = content.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        aiResult = JSON.parse(jsonMatch[0]);
-      } else {
-        console.error("❌ Could not extract JSON from response");
-        return null;
-      }
-    }
-
-    // Validate response structure
-    if (!Array.isArray(aiResult) || aiResult.length === 0) {
-      console.error("❌ Invalid AI response structure:", aiResult);
-      return null;
-    }
-
-    // Validate each recommendation
-    const validRecommendations = aiResult.filter(
-      (rec) =>
-        rec.priority &&
-        rec.category &&
-        rec.title &&
-        rec.description &&
-        rec.action &&
-        rec.impact
+    const raw = res.data?.choices?.[0]?.message?.content || "";
+    const match = raw.match(/\[[\s\S]*\]/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]);
+    const valid = parsed.filter(
+      (r) => r.priority && r.title && r.description && r.action && r.impact,
     );
-
-    if (validRecommendations.length === 0) {
-      console.error("❌ No valid recommendations in AI response");
-      return null;
-    }
-
-    console.log(
-      `✅ AI generated ${validRecommendations.length} recommendations`
-    );
-    return validRecommendations;
+    return valid.length ? valid : null;
   } catch (err) {
-    if (err.code === "ECONNABORTED") {
-      console.error("⏱️ OpenRouter request timeout");
-    } else if (err.response) {
-      console.error(
-        "❌ OpenRouter API error:",
-        err.response.status,
-        err.response.data
-      );
-    } else if (err.request) {
-      console.error("❌ No response from OpenRouter");
-    } else {
-      console.error("❌ OpenRouter error:", err.message);
-    }
+    console.error("Groq AI recommendations error:", err.message);
     return null;
   }
 };
 
-// --- FALLBACK: Hardcoded recommendations ---
-const generateHardcodedRecommendations = (
-  sslGrade,
-  headersMissing,
-  reputation,
-  score
-) => {
-  const recommendations = [];
-
-  // SSL/TLS recommendations
-  if (sslGrade === "N/A" || !sslGrade) {
-    recommendations.push({
-      priority: "critical",
-      category: "SSL/TLS",
-      title: "Enable HTTPS Encryption",
-      description:
-        "Your website is not using HTTPS encryption. This exposes user data to interception and eavesdropping.",
-      action:
-        "Purchase and install an SSL/TLS certificate. Consider using Let's Encrypt for free certificates, or contact your hosting provider for SSL installation.",
-      impact:
-        "Protects sensitive data in transit, prevents man-in-the-middle attacks, and builds user trust with the padlock icon in browsers.",
-    });
-  } else if (["C", "D", "F"].includes(sslGrade)) {
-    recommendations.push({
-      priority: "high",
-      category: "SSL/TLS",
-      title: "Upgrade SSL/TLS Configuration",
-      description: `Your SSL/TLS grade is ${sslGrade}, indicating weak encryption or outdated protocols that attackers can exploit.`,
-      action:
-        "Update your server configuration to support only TLS 1.2 and TLS 1.3. Disable weak cipher suites and deprecated protocols like TLS 1.0 and 1.1.",
-      impact:
-        "Prevents man-in-the-middle attacks, protects against known SSL vulnerabilities, and meets modern security standards.",
-    });
-  } else if (sslGrade === "B") {
-    recommendations.push({
-      priority: "medium",
-      category: "SSL/TLS",
-      title: "Optimize SSL/TLS Configuration",
-      description:
-        "Your SSL/TLS configuration is functional but can be improved for better security.",
-      action:
-        "Review and optimize your cipher suite ordering, enable HSTS with a long max-age, and ensure forward secrecy is properly configured.",
-      impact:
-        "Achieves industry best practices for encryption and maximizes protection against future vulnerabilities.",
-    });
-  }
-
-  // Security headers recommendations
-  headersMissing.forEach((header) => {
-    const headerName = header.replace("Missing ", "");
-
-    if (headerName === "Strict-Transport-Security") {
-      recommendations.push({
-        priority: "high",
-        category: "Security Headers",
-        title: "Implement HTTP Strict Transport Security (HSTS)",
-        description:
-          "HSTS is not configured on your website. This leaves you vulnerable to protocol downgrade attacks where attackers force HTTP connections.",
-        action:
-          "Add the Strict-Transport-Security header to your server configuration: 'max-age=31536000; includeSubDomains; preload'. Then submit your domain to the HSTS preload list.",
-        impact:
-          "Forces browsers to always connect via HTTPS, preventing SSL stripping attacks and ensuring all connections are encrypted.",
-      });
-    }
-
-    if (headerName === "Content-Security-Policy") {
-      recommendations.push({
-        priority: "high",
-        category: "Security Headers",
-        title: "Add Content Security Policy",
-        description:
-          "Your website lacks a Content Security Policy (CSP), leaving it vulnerable to cross-site scripting (XSS) and data injection attacks.",
-        action:
-          "Implement a Content-Security-Policy header that defines which resources can be loaded. Start with a basic policy and gradually tighten it: 'default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'",
-        impact:
-          "Prevents XSS attacks, data injection, and unauthorized code execution by controlling which resources browsers can load.",
-      });
-    }
-
-    if (headerName === "X-Frame-Options") {
-      recommendations.push({
-        priority: "high",
-        category: "Security Headers",
-        title: "Prevent Clickjacking Attacks",
-        description:
-          "The X-Frame-Options header is missing. Your website can be embedded in malicious iframes, enabling clickjacking attacks.",
-        action:
-          "Add the X-Frame-Options header to your server: 'X-Frame-Options: DENY' to prevent all framing, or 'SAMEORIGIN' to allow framing only from your own domain.",
-        impact:
-          "Protects your users from clickjacking attacks where attackers trick them into clicking hidden elements.",
-      });
-    }
-
-    if (headerName === "X-Content-Type-Options") {
-      recommendations.push({
-        priority: "medium",
-        category: "Security Headers",
-        title: "Prevent MIME Type Sniffing",
-        description:
-          "The X-Content-Type-Options header is missing, allowing browsers to MIME-sniff responses and potentially execute malicious content.",
-        action:
-          "Add 'X-Content-Type-Options: nosniff' to your server configuration to prevent browsers from interpreting files as a different MIME type.",
-        impact:
-          "Prevents browsers from executing malicious content by strictly enforcing declared content types.",
-      });
-    }
-
-    if (headerName === "X-XSS-Protection") {
-      recommendations.push({
-        priority: "low",
-        category: "Security Headers",
-        title: "Enable XSS Protection",
-        description:
-          "The X-XSS-Protection header is not set, missing an additional layer of XSS attack protection.",
-        action:
-          "Add 'X-XSS-Protection: 1; mode=block' to your server headers to enable the browser's built-in XSS filter.",
-        impact:
-          "Provides an additional layer of protection against reflected XSS attacks in older browsers.",
-      });
-    }
-
-    if (headerName === "Referrer-Policy") {
-      recommendations.push({
-        priority: "low",
-        category: "Security Headers",
-        title: "Control Referrer Information",
-        description:
-          "Your Referrer-Policy is not set, potentially leaking sensitive information through referrer headers.",
-        action:
-          "Add 'Referrer-Policy: strict-origin-when-cross-origin' or 'no-referrer' to control what referrer information is sent with requests.",
-        impact:
-          "Protects user privacy by controlling what URL information is shared with external sites.",
-      });
-    }
-  });
-
-  // Reputation recommendations
-  if (reputation === "Warning") {
-    recommendations.push({
-      priority: "critical",
-      category: "Domain Reputation",
-      title: "Address Domain Reputation Issues",
-      description:
-        "Your domain has been flagged with reputation concerns or uses suspicious patterns that security tools may block.",
-      action:
-        "Check if your domain is on any blacklists using tools like MXToolbox. Review your DNS configuration, scan for malware, and ensure your domain isn't being used for spam or malicious purposes.",
-      impact:
-        "Maintains trust with users and prevents your website from being blocked by security tools, firewalls, and email filters.",
-    });
-  } else if (reputation === "Unknown") {
-    recommendations.push({
-      priority: "medium",
-      category: "Domain Reputation",
-      title: "Verify Domain Reputation",
-      description:
-        "Your domain's reputation status is unknown, which may affect trust and deliverability.",
-      action:
-        "Use reputation checking tools to verify your domain isn't listed on any blacklists. Monitor your domain regularly using services like Google Safe Browsing and VirusTotal.",
-      impact:
-        "Ensures your domain maintains a clean reputation and isn't inadvertently blocked by security services.",
-    });
-  }
-
-  // Overall score recommendations
-  if (score < 40) {
-    recommendations.push({
-      priority: "critical",
-      category: "Overall Security",
-      title: "Urgent Security Overhaul Required",
-      description:
-        "Your website has critical security deficiencies that pose immediate risk to your business and users.",
-      action:
-        "Prioritize implementing HTTPS, all security headers, and conducting a comprehensive security audit. Consider hiring a security professional to address these urgent issues.",
-      impact:
-        "Protects your business from data breaches, maintains customer trust, and ensures compliance with security regulations.",
-    });
-  } else if (score < 60) {
-    recommendations.push({
-      priority: "high",
-      category: "Overall Security",
-      title: "Significant Security Improvements Needed",
-      description:
-        "Your security posture is below industry standards and leaves you vulnerable to common attacks.",
-      action:
-        "Address all missing security headers as a priority. Upgrade your SSL/TLS configuration and implement a security monitoring solution.",
-      impact:
-        "Brings your security up to acceptable standards and significantly reduces your attack surface.",
-    });
-  } else if (score < 80) {
-    recommendations.push({
-      priority: "medium",
-      category: "Overall Security",
-      title: "Good Security, Room for Excellence",
-      description:
-        "Your security is solid but not excellent. A few improvements will strengthen your overall posture.",
-      action:
-        "Implement any remaining security headers, consider adding a Web Application Firewall (WAF), and establish regular security assessments.",
-      impact:
-        "Achieves security excellence and aligns with best practices used by leading organizations.",
-    });
-  } else {
-    recommendations.push({
-      priority: "low",
-      category: "Overall Security",
-      title: "Maintain Your Excellent Security",
-      description:
-        "Your website has excellent security! Continue monitoring and maintaining your current practices.",
-      action:
-        "Schedule regular security assessments, stay updated on emerging threats, and maintain your security configurations. Consider security awareness training for your team.",
-      impact:
-        "Maintains your strong security posture and ensures you stay ahead of evolving threats.",
-    });
-  }
-
-  // Sort by priority
-  const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
-  recommendations.sort(
-    (a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]
-  );
-
-  return recommendations;
+// ════════════════════════════════════════════════════════════
+// FALLBACK RECOMMENDATIONS — built from actual findings
+// ════════════════════════════════════════════════════════════
+const generateFallbackRecommendations = (allFindings) => {
+  const order = { critical: 0, high: 1, medium: 2, low: 3 };
+  return allFindings
+    .sort((a, b) => order[a.severity] - order[b.severity])
+    .slice(0, 6)
+    .map((f) => ({
+      priority: f.severity,
+      category: f.category,
+      title: f.title,
+      description: f.description,
+      action: f.recommendation,
+      impact: `Addresses ${f.owasp}${f.cwe ? ` (${f.cwe})` : ""}.`,
+    }));
 };
 
-// Calculate overall security score
-const calculateScore = (
-  sslGrade,
-  headersPresent,
-  headersMissing,
-  reputation
-) => {
-  let score = 0;
-
-  // SSL Grade scoring (40 points)
-  const sslScores = { "A+": 40, A: 35, "A-": 30, B: 25, C: 15, D: 10, F: 5 };
-  score += sslScores[sslGrade] || 20;
-
-  // Security headers scoring (40 points)
-  const headerScore = (headersPresent.length / 6) * 40;
-  score += headerScore;
-
-  // Reputation scoring (20 points)
-  if (reputation === "Clean") {
-    score += 20;
-  } else if (reputation === "Warning") {
-    score += 10;
-  }
-
-  return Math.round(score);
-};
-
-// Main analysis function
+// ════════════════════════════════════════════════════════════
+// MAIN: analyzeWebsite
+// ════════════════════════════════════════════════════════════
 const analyzeWebsite = async (req, res) => {
   try {
     const { url } = req.body;
 
-    console.log("🔍 Analyzing website:", url);
+    if (!url)
+      return res
+        .status(400)
+        .json({ success: false, message: "URL is required" });
 
-    if (!url) {
-      return res.status(400).json({
-        success: false,
-        message: "URL is required",
-      });
-    }
-
-    // Validate URL
     const domain = validateUrl(url);
-    if (!domain) {
+    if (!domain)
       return res.status(400).json({
         success: false,
         message: "Invalid URL format. Please include http:// or https://",
       });
-    }
 
-    console.log("✅ Valid domain:", domain);
+    console.log(`🔍 Starting full scan: ${url}`);
 
-    // Perform all checks
-    console.log("🔄 Running security checks...");
-    const [sslGrade, headers, reputation, breachStatus] = await Promise.all([
-      checkSSL(domain),
-      checkSecurityHeaders(url),
-      checkDomainReputation(url),
-      checkBreaches(domain),
-    ]);
-
-    console.log("✅ SSL Grade:", sslGrade);
-    console.log("✅ Headers:", headers);
-    console.log("✅ Reputation:", reputation);
-
-    // Calculate security score
-    const score = calculateScore(
-      sslGrade,
-      headers.present,
-      headers.missing,
-      reputation
-    );
-
-    // Try AI-powered recommendations first
-    let recommendations = await generateAIRecommendations(
-      domain,
-      sslGrade,
-      headers.missing,
-      reputation,
-      score
-    );
-
-    let recommendationMethod = "ai";
-
-    // Fallback to hardcoded if AI fails
-    if (!recommendations) {
-      console.log(
-        "⚠️ AI recommendations failed, using hardcoded recommendations"
-      );
-      recommendations = generateHardcodedRecommendations(
-        sslGrade,
-        headers.missing,
-        reputation,
-        score
-      );
-      recommendationMethod = "hardcoded";
-    } else {
-      console.log("✅ Using AI-generated recommendations");
+    // Layer 0 — Reachability gate
+    const reachability = await checkUrlReachable(url);
+    if (!reachability.reachable) {
+      return res.status(422).json({
+        success: false,
+        message: `Cannot scan this URL: ${reachability.reason}`,
+        code: "URL_UNREACHABLE",
+      });
     }
 
     console.log(
-      `✅ Generated ${recommendations.length} recommendations (${recommendationMethod})`
+      `✅ Reachable (${reachability.statusCode}) — running all scan layers...`,
     );
 
-    // ✅ SAVE TO DATABASE
-    console.log("💾 Saving scan to database...");
-    const websiteScan = await WebsiteScan.create({
+    // Layers 1–4 in parallel
+    const [transportResult, corsResult, safeBrowsing, urlscanResult] =
+      await Promise.all([
+        checkTransportSecurity(url, domain, reachability.headers),
+        checkCORS(url),
+        checkGoogleSafeBrowsing(url),
+        checkUrlScan(url),
+      ]);
+
+    // Layers using already-fetched response
+    const headerResult = checkSecurityHeaders(reachability.headers);
+    const cookieResult = checkCookieSecurity(reachability.headers);
+    const techResult = fingerprintTechnology(
+      reachability.headers,
+      reachability.rawBody,
+    );
+    const reputation = deriveReputation(safeBrowsing, urlscanResult);
+    const reputationResult = buildReputationFindings(
+      safeBrowsing,
+      urlscanResult,
+    );
+
+    // Aggregate all findings
+    const allFindings = [
+      ...transportResult.findings,
+      ...headerResult.findings,
+      ...cookieResult.findings,
+      ...techResult.findings,
+      ...corsResult.findings,
+      ...reputationResult.findings,
+    ];
+
+    const scoreData = calculateScore(
+      allFindings,
+      transportResult.sslGrade,
+      transportResult.hasSSL,
+      headerResult,
+      reputation,
+    );
+    const securityLevel = getSecurityLevel(scoreData.total);
+
+    console.log(
+      `📊 Score: ${scoreData.total} — ${securityLevel.label} | Findings: ${allFindings.length}`,
+    );
+
+    // AI recommendations with Groq fallback
+    let recommendations = await generateAIRecommendations(
+      domain,
+      scoreData,
+      allFindings,
+      reputation,
+    );
+    let recommendationMethod = "ai";
+    if (!recommendations?.length) {
+      recommendations = generateFallbackRecommendations(allFindings);
+      recommendationMethod = "hardcoded";
+    }
+
+    const breachStatus = safeBrowsing.threats.length
+      ? `Flagged: ${safeBrowsing.threats.join(", ")}`
+      : "No threats detected in reputation databases";
+
+    // Save to DB
+    const scan = await WebsiteScan.create({
       userId: req.user._id,
       domain,
       url,
-      score,
-      sslGrade,
-      securityHeaders: headers.present,
-      issues: headers.missing,
+      score: scoreData.total,
+      sslGrade: transportResult.sslGrade,
+      securityLevel: securityLevel.label,
+      scoreBreakdown: scoreData.breakdown,
+      securityHeaders: headerResult.presentHeaders,
+      issues: headerResult.missingHeaders,
       reputation,
       breachStatus,
+      detectedTech: techResult.detectedTech,
+      findings: allFindings,
+      findingSummary: {
+        total: allFindings.length,
+        confirmed: allFindings.filter((f) => f.type === "confirmed").length,
+        probable: allFindings.filter((f) => f.type === "probable").length,
+        posture: allFindings.filter((f) => f.type === "posture").length,
+        bySeverity: {
+          critical: allFindings.filter((f) => f.severity === "critical").length,
+          high: allFindings.filter((f) => f.severity === "high").length,
+          medium: allFindings.filter((f) => f.severity === "medium").length,
+          low: allFindings.filter((f) => f.severity === "low").length,
+        },
+      },
       recommendations,
       recommendationMethod,
     });
 
-    console.log("✅ Scan saved to database with ID:", websiteScan._id);
-
-    // Prepare response
-    const analysisResults = {
-      domain,
-      ssl_grade: sslGrade,
-      headers: headers.present,
-      issues: headers.missing,
-      reputation,
-      breach_status: breachStatus,
-      score,
-      recommendations,
-      recommendationMethod,
-      timestamp: new Date().toISOString(),
-    };
-
-    console.log("✅ Analysis complete. Score:", score);
-
-    res.status(200).json({
-      success: true,
-      ...analysisResults,
-    });
-  } catch (error) {
-    console.error("❌ Analysis error:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to analyze website",
-      error: error.message,
-    });
-  }
-};
-
-// Get scan history
-const getScanHistory = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const limit = parseInt(req.query.limit) || 10;
-
-    console.log(`📊 Fetching scan history for user: ${userId}`);
-
-    const scans = await WebsiteScan.find({ userId })
-      .sort({ scanDate: -1 })
-      .limit(limit)
-      .lean();
-
-    console.log(`✅ Found ${scans.length} scans`);
+    console.log(`💾 Scan saved: ${scan._id}`);
 
     return res.status(200).json({
       success: true,
-      scans: scans,
+      domain,
+      score: scoreData.total,
+      scoreBreakdown: scoreData.breakdown,
+      securityLevel: securityLevel.label,
+      ssl_grade: transportResult.sslGrade,
+      headers: headerResult.presentHeaders,
+      issues: headerResult.missingHeaders,
+      reputation,
+      breach_status: breachStatus,
+      detectedTech: techResult.detectedTech,
+      findings: allFindings,
+      findingSummary: {
+        total: allFindings.length,
+        confirmed: allFindings.filter((f) => f.type === "confirmed").length,
+        probable: allFindings.filter((f) => f.type === "probable").length,
+        posture: allFindings.filter((f) => f.type === "posture").length,
+        bySeverity: {
+          critical: allFindings.filter((f) => f.severity === "critical").length,
+          high: allFindings.filter((f) => f.severity === "high").length,
+          medium: allFindings.filter((f) => f.severity === "medium").length,
+          low: allFindings.filter((f) => f.severity === "low").length,
+        },
+      },
+      recommendations,
+      recommendationMethod,
+      timestamp: new Date().toISOString(),
     });
-  } catch (error) {
-    console.error("❌ Error fetching scan history:", error);
-    res.status(500).json({
+  } catch (err) {
+    console.error("❌ analyzeWebsite error:", err);
+    return res.status(500).json({
       success: false,
-      message: "Failed to fetch scan history",
-      error: error.message,
+      message: "Failed to analyze website",
+      error: err.message,
     });
   }
 };
 
-// Get scan statistics
+// ════════════════════════════════════════════════════════════
+const getScanHistory = async (req, res) => {
+  try {
+    const scans = await WebsiteScan.find({ userId: req.user._id })
+      .sort({ scanDate: -1 })
+      .limit(parseInt(req.query.limit) || 20)
+      .lean();
+    return res.status(200).json({ success: true, scans });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch scan history" });
+  }
+};
+
 const getScanStats = async (req, res) => {
   try {
-    const userId = req.user._id;
     const mongoose = require("mongoose");
-
-    console.log(`📈 Fetching scan stats for user: ${userId}`);
-
     const stats = await WebsiteScan.aggregate([
-      { $match: { userId: new mongoose.Types.ObjectId(userId) } },
+      { $match: { userId: new mongoose.Types.ObjectId(req.user._id) } },
       {
         $group: {
           _id: null,
@@ -712,31 +1042,15 @@ const getScanStats = async (req, res) => {
         },
       },
     ]);
-
-    const result = stats[0] || {
-      totalScans: 0,
-      averageScore: 0,
-      uniqueDomains: 0,
-    };
-
-    console.log("✅ Stats:", result);
-
     return res.status(200).json({
       success: true,
-      stats: result,
+      stats: stats[0] || { totalScans: 0, averageScore: 0, uniqueDomains: 0 },
     });
-  } catch (error) {
-    console.error("❌ Error fetching stats:", error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch statistics",
-      error: error.message,
-    });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch statistics" });
   }
 };
 
-module.exports = {
-  analyzeWebsite,
-  getScanHistory,
-  getScanStats,
-};
+module.exports = { analyzeWebsite, getScanHistory, getScanStats };
