@@ -712,6 +712,10 @@ const calculateScore = (
   headerData,
   reputation,
 ) => {
+  // deduct must be first — everything below uses it
+  const deduct = (findings, map) =>
+    findings.reduce((s, f) => s + (map[f.severity] || 0), 0);
+
   const breakdown = {
     transportSecurity: 0,
     headerSecurity: 0,
@@ -740,31 +744,24 @@ const calculateScore = (
     breakdown.transportSecurity = 0;
   }
 
-  // Headers (15) — already 0 for palm.edu.gh
+  // Headers (15)
   breakdown.headerSecurity = Math.round(
     (headerData.presentHeaders.length / 7) * 15,
   );
 
-  const deduct = (findings, map) =>
-    findings.reduce((s, f) => s + (map[f.severity] || 0), 0);
-
-  // App Security (25)
-  // NOW ALSO deducts for high/critical header findings
-  // Missing CSP and HSTS are application-layer risks, not just config issues
+  // App Security (25) — penalises header findings too
   const headerFindings = allFindings.filter(
     (f) => f.category === "Header Security",
   );
   const appFindings = allFindings.filter(
     (f) => f.category === "Application Security",
   );
-
   const headerAppPenalty = deduct(headerFindings, {
     critical: 4,
     high: 3,
     medium: 1,
     low: 0,
   });
-
   breakdown.applicationSecurity = Math.max(
     0,
     25 -
@@ -809,7 +806,6 @@ const calculateScore = (
   const poorHygieneCount =
     allFindings.filter((f) => f.type === "posture").length +
     Math.floor(allFindings.filter((f) => f.type === "confirmed").length / 3);
-
   breakdown.configurationHygiene = Math.max(0, 5 - poorHygieneCount);
 
   const total = Math.min(
