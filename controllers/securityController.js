@@ -723,35 +723,56 @@ const calculateScore = (
   };
 
   // Transport (20)
-  // N/A means SSL Labs couldn't grade it — treat as unknown, give partial credit
-  // only if HTTPS is confirmed, otherwise penalise heavily
   if (hasSSL) {
-    const pts = { "A+": 20, A: 17, "A-": 15, B: 12, C: 8, D: 4, F: 1, T: 2, "N/A": 6 };
+    const pts = {
+      "A+": 20,
+      A: 17,
+      "A-": 15,
+      B: 12,
+      C: 8,
+      D: 4,
+      F: 1,
+      T: 2,
+      "N/A": 6,
+    };
     breakdown.transportSecurity = pts[sslGrade] ?? 6;
   } else {
-    breakdown.transportSecurity = 0; // no HTTPS at all = 0
+    breakdown.transportSecurity = 0;
   }
 
-  // Headers (15) 
+  // Headers (15) — already 0 for palm.edu.gh
   breakdown.headerSecurity = Math.round(
     (headerData.presentHeaders.length / 7) * 15,
   );
 
-
-  // App Security (25)
   const deduct = (findings, map) =>
     findings.reduce((s, f) => s + (map[f.severity] || 0), 0);
+
+  // App Security (25)
+  // NOW ALSO deducts for high/critical header findings
+  // Missing CSP and HSTS are application-layer risks, not just config issues
+  const headerFindings = allFindings.filter(
+    (f) => f.category === "Header Security",
+  );
+  const appFindings = allFindings.filter(
+    (f) => f.category === "Application Security",
+  );
+
+  const headerAppPenalty = deduct(headerFindings, {
+    critical: 4,
+    high: 3,
+    medium: 1,
+    low: 0,
+  });
 
   breakdown.applicationSecurity = Math.max(
     0,
     25 -
-      deduct(
-        allFindings.filter((f) => f.category === "Application Security"),
-        { critical: 12, high: 8, medium: 4, low: 2 },
-      ),
+      deduct(appFindings, { critical: 12, high: 8, medium: 4, low: 2 }) -
+      headerAppPenalty,
   );
 
-  // Tech Risk (15) 
+  // Tech Risk (15)
   breakdown.technologyRisk = Math.max(
     0,
     15 -
@@ -761,7 +782,7 @@ const calculateScore = (
       ),
   );
 
-  // Infrastructure (10) 
+  // Infrastructure (10)
   breakdown.infrastructureExposure = Math.max(
     0,
     10 -
@@ -772,10 +793,8 @@ const calculateScore = (
   );
 
   // Reputation (10)
-  // Clean but with many confirmed findings = partial credit, not full
-  // A site can be "not blacklisted" but still be poorly secured
-   const confirmedHighCount = allFindings.filter(
-    (f) => f.type === "confirmed" && ["critical", "high"].includes(f.severity)
+  const confirmedHighCount = allFindings.filter(
+    (f) => f.type === "confirmed" && ["critical", "high"].includes(f.severity),
   ).length;
 
   if (reputation === "Warning") {
@@ -783,24 +802,19 @@ const calculateScore = (
   } else if (reputation === "Unknown") {
     breakdown.threatReputation = 4;
   } else {
-    // Clean reputation — but scale down if site has many confirmed serious findings
-    // A clean-but-broken site shouldn't get full reputation marks
     breakdown.threatReputation = confirmedHighCount >= 4 ? 6 : 10;
   }
 
   // Config Hygiene (5)
-  // FIX: penalise confirmed findings too, not just posture
-  // Previous logic gave 5/5 if everything was "confirmed" — backwards
   const poorHygieneCount =
     allFindings.filter((f) => f.type === "posture").length +
     Math.floor(allFindings.filter((f) => f.type === "confirmed").length / 3);
-    // every 3 confirmed findings = 1 hygiene penalty point
 
   breakdown.configurationHygiene = Math.max(0, 5 - poorHygieneCount);
 
   const total = Math.min(
     100,
-    Math.round(Object.values(breakdown).reduce((a, b) => a + b, 0))
+    Math.round(Object.values(breakdown).reduce((a, b) => a + b, 0)),
   );
   return { total, breakdown };
 };
