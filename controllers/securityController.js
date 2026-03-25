@@ -582,7 +582,7 @@ const checkUrlScan = async (url) => {
   try {
     const submit = await axios.post(
       "https://urlscan.io/api/v1/scan/",
-      { url, visibility: "unlisted" },
+      { url, visibility: "unlisted", country: "US" },
       {
         headers: { "API-Key": apiKey, "Content-Type": "application/json" },
         timeout: 10000,
