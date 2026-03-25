@@ -39,6 +39,9 @@ const authUser = asyncHandler(async (req, res) => {
 
   const user = await User.findOne({ email });
 
+  console.log("🔍 Login attempt:", email);
+console.log("👤 User found:", user ? "yes" : "NO USER FOUND");
+
   if (user && (await user.matchPassword(password))) {
     user.lastLogin = new Date();
     await user.save();
