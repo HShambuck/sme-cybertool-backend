@@ -576,8 +576,7 @@ const checkGoogleSafeBrowsing = async (url) => {
 // ════════════════════════════════════════════════════════════
 const checkUrlScan = async (url) => {
   const apiKey = process.env.URLSCAN_API_KEY;
-  if (!apiKey)
-    return { verdict: "unknown", malicious: false, source: "skipped" };
+  if (!apiKey) return { verdict: "unknown", malicious: false, source: "skipped" };
 
   try {
     const submit = await axios.post(
@@ -585,61 +584,40 @@ const checkUrlScan = async (url) => {
       { url, visibility: "unlisted", country: "US" },
       {
         headers: { "API-Key": apiKey, "Content-Type": "application/json" },
-        timeout: 10000,
-      },
+        timeout: 8000,
+      }
     );
 
     const uuid = submit.data.uuid;
-    if (!uuid) {
-      return {
-        verdict: "unknown",
-        malicious: false,
-        source: "urlscan_no_uuid",
-      };
-    }
+    if (!uuid) return { verdict: "unknown", malicious: false, source: "urlscan_no_uuid" };
 
-    let resultData = null;
-
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 2; i++) {
+      await new Promise((r) => setTimeout(r, 5000));
       try {
-        await new Promise((r) => setTimeout(r, 5000));
-
         const result = await axios.get(
           `https://urlscan.io/api/v1/result/${uuid}/`,
-          {
-            headers: { "API-Key": apiKey },
-            timeout: 10000,
-          },
+          { headers: { "API-Key": apiKey }, timeout: 5000 }
         );
-
-        resultData = result.data;
-        break;
+        const v = result.data.verdicts?.overall;
+        return {
+          verdict: !v ? "unknown" : v.score > 50 ? "suspicious" : "clean",
+          malicious: v?.malicious || false,
+          score: v?.score || 0,
+          source: "urlscan",
+        };
       } catch (err) {
-        if (err.response?.status !== 404) throw err;
+        if (err.response?.status !== 404) break;
+        // 404 = not ready yet, loop continues
       }
     }
 
-    if (!resultData) {
-      return {
-        verdict: "unknown",
-        malicious: false,
-        source: "urlscan_pending",
-      };
-    }
-
-    const v = resultData.verdicts?.overall;
-
-    return {
-      verdict: !v ? "unknown" : v.score > 50 ? "suspicious" : "clean",
-      malicious: v?.malicious || false,
-      score: v?.score || 0,
-      source: "urlscan",
-    };
+    return { verdict: "unknown", malicious: false, source: "urlscan_pending" };
   } catch (err) {
     console.error("URLScan error:", err.message);
     return { verdict: "unknown", malicious: false, source: "urlscan_error" };
   }
 };
+
 // ════════════════════════════════════════════════════════════
 // LAYER 5: Reputation signals
 // ════════════════════════════════════════════════════════════
@@ -941,14 +919,36 @@ const analyzeWebsite = async (req, res) => {
       `✅ Reachable (${reachability.statusCode}) — running all scan layers...`,
     );
 
+    const withTimeout = (promise, ms, fallback) =>
+  Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
+
     // Layers 1–4 in parallel
     const [transportResult, corsResult, safeBrowsing, urlscanResult] =
-      await Promise.all([
-        checkTransportSecurity(url, domain, reachability.headers),
-        checkCORS(url),
-        checkGoogleSafeBrowsing(url),
-        checkUrlScan(url),
-      ]);
+  await Promise.all([
+    withTimeout(
+      checkTransportSecurity(url, domain, reachability.headers),
+      12000,
+      { findings: [], sslGrade: "N/A", hasSSL: url.startsWith("https://") }
+    ),
+    withTimeout(
+      checkCORS(url),
+      5000,
+      { findings: [] }
+    ),
+    withTimeout(
+      checkGoogleSafeBrowsing(url),
+      5000,
+      { safe: true, threats: [], source: "timeout" }
+    ),
+    withTimeout(
+      checkUrlScan(url),
+      15000,
+      { verdict: "unknown", malicious: false, source: "timeout" }
+    ),
+  ]);
 
     // Layers using already-fetched response
     const headerResult = checkSecurityHeaders(reachability.headers);
