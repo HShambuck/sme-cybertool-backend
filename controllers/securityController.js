@@ -691,6 +691,16 @@ const buildReputationFindings = (safeBrowsing, urlscan) => {
 };
 
 // ════════════════════════════════════════════════════════════
+// SECURITY LEVEL LABEL — must be defined BEFORE calculateScore
+// ════════════════════════════════════════════════════════════
+const getSecurityLevel = (score) => {
+  if (score >= 80) return { label: "Secure", color: "green" };
+  if (score >= 60) return { label: "Moderately Secure", color: "yellow" };
+  if (score >= 40) return { label: "At Risk", color: "orange" };
+  return { label: "Highly Vulnerable", color: "red" };
+};
+
+// ════════════════════════════════════════════════════════════
 // SCORING ENGINE
 // Transport(20) Headers(15) AppSec(25) TechRisk(15)
 // Infra(10) Reputation(10) Config(5)
