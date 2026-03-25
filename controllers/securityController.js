@@ -781,7 +781,7 @@ const generateAIRecommendations = async (
   reputation,
 ) => {
   const apiKey = process.env.GROQ_API_KEY;
-  const model = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+  const model = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
   if (!apiKey) return null;
 
   const topFindings = allFindings
@@ -803,9 +803,10 @@ ${topFindings || "None"}
     const res = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
       {
-        model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+        model,
         max_completion_tokens: 1800,
         temperature: 0.6,
+        top_p: 1,
         messages: [
           {
             role: "system",
