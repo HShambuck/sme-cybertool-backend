@@ -1,4 +1,4 @@
-// models/Recommendation.js
+// models/Recommendations.js
 const mongoose = require("mongoose");
 
 const recommendationSchema = new mongoose.Schema({
@@ -7,10 +7,13 @@ const recommendationSchema = new mongoose.Schema({
     ref: "Assessment",
     required: true,
   },
-  text: {
-    type: String,
+  userId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
     required: true,
+    index: true,
   },
+  text: { type: String, required: true },
   priority: {
     type: String,
     enum: ["low", "medium", "high", "critical"],
@@ -19,9 +22,6 @@ const recommendationSchema = new mongoose.Schema({
   relatedTrainingModuleId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "TrainingModule",
-  },
-  videoUrl: {
-    type: String, // URL to the training video
   },
   status: {
     type: String,
@@ -42,14 +42,11 @@ const recommendationSchema = new mongoose.Schema({
     ],
     required: true,
   },
-  createdAt: {
-    type: Date,
-    default: Date.now,
-  },
+  createdAt: { type: Date, default: Date.now },
 });
 
-// Add index for faster queries
 recommendationSchema.index({ assessmentId: 1, status: 1 });
+recommendationSchema.index({ userId: 1, status: 1 });
 recommendationSchema.index({ category: 1 });
 
 module.exports = mongoose.model("Recommendation", recommendationSchema);

@@ -2,6 +2,7 @@
 const asyncHandler = require("express-async-handler");
 const Assessment = require("../models/Assessment");
 const Recommendation = require("../models/Recommendations");
+const TrainingModule = require("../models/TrainingModule");
 const axios = require("axios");
 
 // --- HELPER: Fallback manual scoring ---
@@ -189,72 +190,78 @@ const getCategoryFromQuestionId = (questionId) => {
 };
 
 // Generate recommendations based on weak areas
-const generateRecommendations = async (questionsAnswered, assessmentId) => {
+const generateRecommendations = async (questionsAnswered, assessmentId, userId) => {
   const weakAreas = questionsAnswered.filter((q) => q.scoreImpact <= 2);
 
   const recommendationMap = {
-    q1: "Implement unique user accounts for all employees to improve access control.",
-    q2: "Enable multi-factor authentication (MFA) on all critical business systems.",
-    q3: "Enforce strong password policies requiring minimum 12 characters with complexity.",
-    q4: "Establish a process to immediately revoke access for departing employees.",
-    q5: "Deploy a company-wide password manager for secure credential storage.",
-    q6: "Set up automated daily backups of all critical business data.",
-    q7: "Implement the 3-2-1 backup rule: 3 copies, 2 different media, 1 offsite.",
-    q8: "Schedule quarterly backup restoration tests to ensure recovery capability.",
-    q9: "Develop a documented disaster recovery plan with clear RTO/RPO objectives.",
-    q10: "Encrypt all backups and isolate them from production networks.",
-    q11: "Enable automatic updates for operating systems and critical software.",
-    q12: "Conduct a software audit and replace all unlicensed software.",
-    q13: "Deploy enterprise-grade antivirus/anti-malware on all devices.",
-    q14: "Create and maintain a comprehensive IT asset inventory.",
-    q15: "Implement quarterly phishing awareness training for all employees.",
-    q16: "Deploy advanced email filtering and anti-spam solutions.",
-    q17: "Establish a phishing reporting system and incident response process.",
-    q18: "Implement multi-step verification for sensitive transactions and wire transfers.",
-    q19: "Upgrade Wi-Fi security to WPA3 or WPA2-Enterprise encryption.",
-    q20: "Install a hardware firewall to protect your network perimeter.",
-    q21: "Require VPN usage for all remote access to company resources.",
-    q22: "Create a separate guest Wi-Fi network isolated from business systems.",
-    q23: "Develop and test a comprehensive cybersecurity incident response plan.",
-    q24: "Obtain cybersecurity insurance to mitigate financial risk from breaches.",
-    q25: "Implement continuous security monitoring and logging on all systems.",
-    q26: "Restrict physical access to servers and networking gear with locked rooms.",
-    q27: "Deploy CCTV and access logs with periodic reviews of footage.",
-    q28: "Require employee ID badges or keycards for building access.",
-    q29: "Encrypt all laptops and mobile devices to protect sensitive data.",
-    q30: "Enforce mandatory device lock with strong authentication.",
-    q31: "Implement a BYOD policy with Mobile Device Management (MDM).",
-    q32: "Classify and label sensitive data with access policies.",
-    q33: "Ensure compliance with privacy regulations (GDPR, CCPA, local laws).",
-    q34: "Perform cybersecurity due diligence before engaging vendors.",
-    q35: "Include mandatory data protection clauses in vendor contracts.",
+    q1:  { text: "Implement unique user accounts for all employees.", category: "security_measure" },
+    q2:  { text: "Enable multi-factor authentication (MFA) on all critical systems.", category: "security_measure" },
+    q3:  { text: "Enforce strong password policies (minimum 12 characters).", category: "security_measure" },
+    q4:  { text: "Establish a process to immediately revoke access for departing employees.", category: "security_measure" },
+    q5:  { text: "Deploy a company-wide password manager.", category: "security_measure" },
+    q6:  { text: "Set up automated daily backups of all critical business data.", category: "data_protection" },
+    q7:  { text: "Implement the 3-2-1 backup rule: 3 copies, 2 different media, 1 offsite.", category: "data_protection" },
+    q8:  { text: "Schedule quarterly backup restoration tests.", category: "data_protection" },
+    q9:  { text: "Develop a documented disaster recovery plan.", category: "data_protection" },
+    q10: { text: "Encrypt all backups and isolate them from production networks.", category: "data_protection" },
+    q11: { text: "Enable automatic updates for operating systems and software.", category: "technical" },
+    q12: { text: "Conduct a software audit and replace all unlicensed software.", category: "technical" },
+    q13: { text: "Deploy enterprise-grade antivirus on all devices.", category: "technical" },
+    q14: { text: "Create and maintain a comprehensive IT asset inventory.", category: "technical" },
+    q15: { text: "Implement quarterly phishing awareness training.", category: "training" },
+    q16: { text: "Deploy advanced email filtering and anti-spam solutions.", category: "training" },
+    q17: { text: "Establish a phishing reporting system.", category: "training" },
+    q18: { text: "Implement multi-step verification for sensitive transactions.", category: "training" },
+    q19: { text: "Upgrade Wi-Fi security to WPA3 or WPA2-Enterprise.", category: "technical" },
+    q20: { text: "Install a hardware firewall to protect your network.", category: "technical" },
+    q21: { text: "Require VPN usage for all remote access.", category: "technical" },
+    q22: { text: "Create a separate guest Wi-Fi network.", category: "technical" },
+    q23: { text: "Develop and test a cybersecurity incident response plan.", category: "policy" },
+    q24: { text: "Obtain cybersecurity insurance.", category: "policy" },
+    q25: { text: "Implement continuous security monitoring.", category: "policy" },
+    q26: { text: "Restrict physical access to servers with locked rooms.", category: "physical_security" },
+    q27: { text: "Deploy CCTV and access logs with periodic reviews.", category: "physical_security" },
+    q28: { text: "Require employee ID badges for building access.", category: "physical_security" },
+    q29: { text: "Encrypt all laptops and mobile devices.", category: "device_security" },
+    q30: { text: "Enforce mandatory device lock with strong authentication.", category: "device_security" },
+    q31: { text: "Implement a BYOD policy with Mobile Device Management.", category: "device_security" },
+    q32: { text: "Classify and label sensitive data with access policies.", category: "data_protection" },
+    q33: { text: "Ensure compliance with privacy regulations (GDPR, local laws).", category: "data_protection" },
+    q34: { text: "Perform cybersecurity due diligence before engaging vendors.", category: "vendor" },
+    q35: { text: "Include data protection clauses in vendor contracts.", category: "vendor" },
   };
+
+  // Load all training modules once
+  const allModules = await TrainingModule.find({ isPublished: true }).select("_id category");
+
+  // Build a category → moduleId map (first match per category)
+  const categoryToModule = {};
+  allModules.forEach((m) => {
+    if (!categoryToModule[m.category]) {
+      categoryToModule[m.category] = m._id;
+    }
+  });
 
   const recDocs = weakAreas
     .filter((q) => recommendationMap[q.questionId])
-    .map((q) => ({
-      assessmentId,
-      text: recommendationMap[q.questionId],
-      priority: q.scoreImpact === 0 ? "high" : "medium",
-      status: "pending",
-      category: getCategoryFromQuestionId(q.questionId),
-    }));
+    .map((q) => {
+      const mapped = recommendationMap[q.questionId];
+      return {
+        assessmentId,
+        userId,                                          // ← now included
+        text: mapped.text,
+        priority: q.scoreImpact === 0 ? "high" : "medium",
+        status: "pending",
+        category: mapped.category,
+        relatedTrainingModuleId: categoryToModule[mapped.category] || null, // ← linked
+      };
+    });
 
-  if (recDocs.length === 0) {
-    console.log("✅ No recommendations needed - excellent security posture!");
-    return [];
-  }
+  if (recDocs.length === 0) return [];
 
-  try {
-    const createdRecs = await Recommendation.insertMany(recDocs);
-    console.log(
-      `✅ Successfully created ${createdRecs.length} recommendations`,
-    );
-    return createdRecs.map((r) => r._id);
-  } catch (error) {
-    console.error("❌ Error creating recommendations:", error);
-    throw error;
-  }
+  const createdRecs = await Recommendation.insertMany(recDocs);
+  console.log(`✅ Created ${createdRecs.length} recommendations with module links`);
+  return createdRecs.map((r) => r._id);
 };
 
 // Normalize level from AI response
@@ -311,8 +318,7 @@ const createAssessment = asyncHandler(async (req, res) => {
 
   // --- Generate recommendations ---
   console.log("🔄 Generating recommendations...");
-  const recs = await generateRecommendations(questionsAnswered, assessment._id);
-
+  const recs = await generateRecommendations(questionsAnswered, assessment._id, req.user._id);
   console.log("✅ Generated", recs.length, "recommendations");
 
   // Update assessment with recommendation IDs
