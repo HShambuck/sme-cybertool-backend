@@ -582,29 +582,55 @@ const checkUrlScan = async (url) => {
   try {
     const submit = await axios.post(
       "https://urlscan.io/api/v1/scan/",
-      { url, visibility: "private" },
+      { url, visibility: "unlisted" },
       {
         headers: { "API-Key": apiKey, "Content-Type": "application/json" },
         timeout: 10000,
       },
     );
+
     const uuid = submit.data.uuid;
-    if (!uuid)
+    if (!uuid) {
       return {
         verdict: "unknown",
         malicious: false,
         source: "urlscan_no_uuid",
       };
+    }
 
-    await new Promise((r) => setTimeout(r, 12000));
+    let resultData = null;
 
-    const result = await axios.get(
-      `https://urlscan.io/api/v1/result/${uuid}/`,
-      { timeout: 10000 },
-    );
-    const v = result.data.verdicts?.overall;
+    for (let i = 0; i < 5; i++) {
+      try {
+        await new Promise((r) => setTimeout(r, 5000));
+
+        const result = await axios.get(
+          `https://urlscan.io/api/v1/result/${uuid}/`,
+          {
+            headers: { "API-Key": apiKey },
+            timeout: 10000,
+          },
+        );
+
+        resultData = result.data;
+        break;
+      } catch (err) {
+        if (err.response?.status !== 404) throw err;
+      }
+    }
+
+    if (!resultData) {
+      return {
+        verdict: "unknown",
+        malicious: false,
+        source: "urlscan_pending",
+      };
+    }
+
+    const v = resultData.verdicts?.overall;
+
     return {
-      verdict: v?.score > 50 ? "suspicious" : "clean",
+      verdict: !v ? "unknown" : v.score > 50 ? "suspicious" : "clean",
       malicious: v?.malicious || false,
       score: v?.score || 0,
       source: "urlscan",
@@ -614,7 +640,6 @@ const checkUrlScan = async (url) => {
     return { verdict: "unknown", malicious: false, source: "urlscan_error" };
   }
 };
-
 // ════════════════════════════════════════════════════════════
 // LAYER 5: Reputation signals
 // ════════════════════════════════════════════════════════════
