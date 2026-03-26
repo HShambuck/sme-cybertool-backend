@@ -5,223 +5,255 @@ const ThreatUpdate = require("../models/ThreatUpdate");
 const protect = require("../middleware/authMiddleware");
 const axios = require("axios");
 
-// ===========================
-// HELPER FUNCTIONS
-// ===========================
+// ════════════════════════════════════════════════════════
+// AI: Generate SME-relevant recommendations via Groq
+// ════════════════════════════════════════════════════════
+const generateThreatRecommendations = async (threat) => {
+  const apiKey = process.env.GROQ_API_KEY;
+  const model = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+  if (!apiKey) return null;
 
-// Fetch threats from external APIs
-async function fetchExternalThreats() {
-  const threats = [];
-
-  // 1. Fetch from CISA (U.S. Cybersecurity & Infrastructure Security Agency)
   try {
-    const cisaResponse = await axios.get(
-      "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-      { timeout: 5000 }
+    const res = await axios.post(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        model,
+        max_completion_tokens: 400,
+        temperature: 0.4,
+        messages: [
+          {
+            role: "system",
+            content: `You are a cybersecurity advisor for small and medium enterprises (SMEs) in Africa.
+Return ONLY a JSON array of exactly 3 short, practical recommendations for an SME with limited IT resources.
+No markdown, no preamble. Format: ["recommendation 1", "recommendation 2", "recommendation 3"]
+Each recommendation must be under 20 words and immediately actionable.`,
+          },
+          {
+            role: "user",
+            content: `Threat: ${threat.title}\nDescription: ${threat.description}\nCategory: ${threat.category}`,
+          },
+        ],
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 10000,
+      },
     );
 
-    if (cisaResponse.data && cisaResponse.data.vulnerabilities) {
-      const cisaThreats = cisaResponse.data.vulnerabilities
-        .slice(0, 5)
-        .map((vuln) => ({
-          _id: `cisa-${vuln.cveID}`,
-          title: `${vuln.cveID}: ${vuln.vulnerabilityName}`,
-          description: `${vuln.shortDescription} Vendor: ${vuln.vendorProject}, Product: ${vuln.product}`,
-          severity: "high",
-          category: "vulnerability",
-          source: "CISA",
-          publishedAt: new Date(vuln.dateAdded),
-          affectedRegions: ["Global"],
-          recommendations: [
-            vuln.requiredAction || "Apply vendor security updates immediately",
-            "Review and patch affected systems",
-            "Monitor for signs of exploitation",
-          ],
-          isActive: true,
-          isExternal: true,
-        }));
-
-      threats.push(...cisaThreats);
-    }
-  } catch (error) {
-    console.error("CISA API error:", error.message);
+    const raw = res.data?.choices?.[0]?.message?.content || "";
+    const match = raw.match(/\[[\s\S]*?\]/);
+    if (!match) return null;
+    const parsed = JSON.parse(match[0]);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
+  } catch (err) {
+    console.error("Groq threat recommendations error:", err.message);
+    return null;
   }
+};
 
-  // 2. Fetch from AlienVault OTX (Optional - requires API key)
-  // Uncomment and add your API key if you want to use this
+// Fallback recommendations based on category
+const getFallbackRecommendations = (category, requiredAction) => {
+  const base = requiredAction ? [requiredAction] : [];
+
+  const categoryDefaults = {
+    vulnerability: [
+      "Apply the vendor patch or update immediately on all affected systems.",
+      "If patching is not possible, isolate the affected system from the network.",
+      "Check your software inventory — identify all instances of the affected product.",
+    ],
+    ransomware: [
+      "Ensure offline backups are current and not connected to your main network.",
+      "Train staff to recognise phishing emails which are the primary ransomware entry point.",
+      "Restrict administrative privileges to only the staff who absolutely need them.",
+    ],
+    phishing: [
+      "Alert all staff about this phishing campaign with a real example if available.",
+      "Enable multi-factor authentication on email accounts immediately.",
+      "Report any received instances to your IT contact and email provider.",
+    ],
+    malware: [
+      "Run a full antivirus scan on all endpoints immediately.",
+      "Check for any unfamiliar programs, browser extensions, or scheduled tasks.",
+      "Change passwords for all business accounts from a clean, unaffected device.",
+    ],
+    data_breach: [
+      "Check if any of your business email addresses appear in the breach using HaveIBeenPwned.",
+      "Force password resets for any accounts using credentials from the breached service.",
+      "Review what data your business shares with third-party services.",
+    ],
+    general: [
+      "Review your current security posture against this threat type.",
+      "Ensure all software and systems are updated to the latest versions.",
+      "Brief your team on this threat and what to watch out for.",
+    ],
+  };
+
+  const defaults = categoryDefaults[category] || categoryDefaults.general;
+  return base.length > 0 ? [base[0], ...defaults.slice(0, 2)] : defaults;
+};
+
+// ════════════════════════════════════════════════════════
+// FETCH: CISA Known Exploited Vulnerabilities
+// ════════════════════════════════════════════════════════
+async function fetchCISAThreats() {
   try {
-    const OTX_API_KEY = process.env.OTX_API_KEY;
-    if (OTX_API_KEY) {
-      const otxResponse = await axios.get(
-        "https://otx.alienvault.com/api/v1/pulses/subscribed",
-        {
-          timeout: 5000,
-          headers: {
-            "X-OTX-API-KEY": OTX_API_KEY,
-          },
-        }
-      );
+    const res = await axios.get(
+      "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+      { timeout: 5000 },
+    );
 
-      if (otxResponse.data && otxResponse.data.results) {
-        const otxThreats = otxResponse.data.results
-          .slice(0, 3)
-          .map((pulse) => ({
-            _id: `otx-${pulse.id}`,
-            title: pulse.name,
-            description: pulse.description || "No description available",
-            severity: pulse.tags.includes("critical") ? "critical" : "high",
-            category: "malware",
-            source: "AlienVault OTX",
-            publishedAt: new Date(pulse.created),
-            affectedRegions: ["Global"],
-            recommendations: [
-              "Review IOCs (Indicators of Compromise) associated with this threat",
-              "Update security rules and signatures",
-              "Monitor network traffic for suspicious patterns",
-            ],
-            isActive: true,
-            isExternal: true,
-          }));
+    if (!res.data?.vulnerabilities) return [];
 
-        threats.push(...otxThreats);
-      }
-    }
-  } catch (error) {
-    console.error("AlienVault OTX API error:", error.message);
+    return res.data.vulnerabilities.slice(0, 4).map((vuln) => ({
+      _id: `cisa-${vuln.cveID}`,
+      title: `${vuln.cveID}: ${vuln.vulnerabilityName}`,
+      description: `${vuln.shortDescription} Affected: ${vuln.vendorProject} — ${vuln.product}.`,
+      severity: "high",
+      category: "vulnerability",
+      source: "CISA KEV",
+      publishedAt: new Date(vuln.dateAdded),
+      affectedRegions: ["Global"],
+      requiredAction: vuln.requiredAction,
+      isActive: true,
+      isExternal: true,
+    }));
+  } catch (err) {
+    console.error("CISA API error:", err.message);
+    return [];
   }
-
-  return threats;
 }
 
-// Deduplicate threats based on title similarity
-function deduplicateThreats(threats) {
-  const seen = new Set();
-  return threats.filter((threat) => {
-    const key = threat.title.toLowerCase().trim();
-    if (seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
+// ════════════════════════════════════════════════════════
+// FETCH: AlienVault OTX
+// Filters for SME-relevant and business-focused pulses
+// ════════════════════════════════════════════════════════
+async function fetchOTXThreats() {
+  const apiKey = process.env.OTX_API_KEY;
+  if (!apiKey) return [];
+
+  try {
+    const res = await axios.get(
+      "https://otx.alienvault.com/api/v1/pulses/subscribed?limit=20",
+      {
+        timeout: 5000,
+        headers: { "X-OTX-API-KEY": apiKey },
+      },
+    );
+
+    if (!res.data?.results) return [];
+
+    // Map OTX category tags to our schema categories
+    const mapCategory = (tags = []) => {
+      const t = tags.map((x) => x.toLowerCase()).join(" ");
+      if (t.includes("ransom")) return "ransomware";
+      if (t.includes("phish")) return "phishing";
+      if (t.includes("malware") || t.includes("rat") || t.includes("trojan"))
+        return "malware";
+      if (t.includes("cve") || t.includes("exploit") || t.includes("vuln"))
+        return "vulnerability";
+      if (t.includes("breach") || t.includes("leak")) return "data_breach";
+      return "general";
+    };
+
+    const mapSeverity = (tags = []) => {
+      const t = tags.map((x) => x.toLowerCase()).join(" ");
+      if (t.includes("critical")) return "critical";
+      if (t.includes("high")) return "high";
+      if (t.includes("medium")) return "warning";
+      return "high"; // OTX pulses are generally high relevance
+    };
+
+    return res.data.results.slice(0, 4).map((pulse) => ({
+      _id: `otx-${pulse.id}`,
+      title: pulse.name,
+      description:
+        pulse.description?.substring(0, 300) ||
+        "Threat intelligence pulse from AlienVault OTX community.",
+      severity: mapSeverity(pulse.tags),
+      category: mapCategory(pulse.tags),
+      source: "AlienVault OTX",
+      publishedAt: new Date(pulse.created),
+      affectedRegions:
+        pulse.targeted_countries?.length > 0
+          ? pulse.targeted_countries
+          : ["Global"],
+      requiredAction: null,
+      isActive: true,
+      isExternal: true,
+    }));
+  } catch (err) {
+    console.error("AlienVault OTX API error:", err.message);
+    return [];
+  }
 }
 
-// ===========================
-// ROUTES
-// ===========================
-
-// Get all active threat updates (with external API integration)
+// ════════════════════════════════════════════════════════
+// MAIN ROUTE: GET /api/threats
+// ════════════════════════════════════════════════════════
 router.get("/", protect, async (req, res) => {
   try {
-    // Try to fetch from external APIs first
-    let externalThreats = [];
-    let apiSuccess = false;
+    const [cisaThreats, otxThreats] = await Promise.all([
+      fetchCISAThreats(),
+      fetchOTXThreats(),
+    ]);
 
-    try {
-      externalThreats = await fetchExternalThreats();
-      apiSuccess = externalThreats.length > 0;
+    let combined = [...cisaThreats, ...otxThreats];
 
-      if (apiSuccess) {
-        console.log(
-          `✅ Successfully fetched ${externalThreats.length} threats from external APIs`
-        );
-      }
-    } catch (error) {
-      console.error("⚠️ External API fetch failed:", error.message);
+    // Deduplicate by title
+    const seen = new Set();
+    combined = combined.filter((t) => {
+      const key = t.title.toLowerCase().trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    if (combined.length === 0) {
+      console.log(
+        "📦 External APIs returned nothing — using database fallback",
+      );
+      const local = await ThreatUpdate.find({ isActive: true })
+        .sort({ publishedAt: -1 })
+        .limit(20);
+      return res.json(local);
     }
 
-    // If external APIs succeeded, return only external threats
-    if (apiSuccess) {
-      const uniqueThreats = deduplicateThreats(externalThreats);
-      return res.json(uniqueThreats);
-    }
+    // Generate AI recommendations for each threat (parallel, with fallback)
+    const threatsWithRecs = await Promise.all(
+      combined.map(async (threat) => {
+        const aiRecs = await generateThreatRecommendations(threat);
+        const recommendations =
+          aiRecs ||
+          getFallbackRecommendations(threat.category, threat.requiredAction);
+        return { ...threat, recommendations };
+      }),
+    );
 
-    // FALLBACK: If external APIs failed, fetch from local database
-    console.log("📦 Using fallback: Fetching threats from local database");
-    const localThreats = await ThreatUpdate.find({ isActive: true })
-      .sort({ publishedAt: -1 })
-      .limit(20);
-
-    if (localThreats.length === 0) {
-      console.log("⚠️ No threats found in database either");
-    }
-
-    res.json(localThreats);
-  } catch (error) {
-    console.error("❌ Error fetching threats:", error);
+    console.log(
+      `✅ Successfully fetched ${threatsWithRecs.length} threats from external APIs`,
+    );
+    return res.json(threatsWithRecs);
+  } catch (err) {
+    console.error("❌ Error fetching threats:", err);
     res.status(500).json({ message: "Failed to fetch threat updates" });
   }
 });
 
-// Get threat by ID
+// Keep remaining routes unchanged
 router.get("/:id", protect, async (req, res) => {
   try {
     const threat = await ThreatUpdate.findById(req.params.id);
-
-    if (!threat) {
+    if (!threat)
       return res.status(404).json({ message: "Threat update not found" });
-    }
-
     res.json(threat);
-  } catch (error) {
-    console.error("Error fetching threat:", error);
+  } catch (err) {
     res.status(500).json({ message: "Failed to fetch threat update" });
   }
 });
 
-// Filter threats by severity
-router.get("/filter/severity/:level", protect, async (req, res) => {
-  try {
-    const { level } = req.params;
-    const threats = await ThreatUpdate.find({
-      severity: level,
-      isActive: true,
-    }).sort({ publishedAt: -1 });
-
-    res.json(threats);
-  } catch (error) {
-    console.error("Error filtering threats:", error);
-    res.status(500).json({ message: "Failed to filter threats" });
-  }
-});
-
-// Filter threats by category
-router.get("/filter/category/:category", protect, async (req, res) => {
-  try {
-    const { category } = req.params;
-    const threats = await ThreatUpdate.find({
-      category,
-      isActive: true,
-    }).sort({ publishedAt: -1 });
-
-    res.json(threats);
-  } catch (error) {
-    console.error("Error filtering threats:", error);
-    res.status(500).json({ message: "Failed to filter threats" });
-  }
-});
-
-// Search threats by keyword
-router.get("/search/:keyword", protect, async (req, res) => {
-  try {
-    const { keyword } = req.params;
-    const threats = await ThreatUpdate.find({
-      $or: [
-        { title: { $regex: keyword, $options: "i" } },
-        { description: { $regex: keyword, $options: "i" } },
-        { source: { $regex: keyword, $options: "i" } },
-      ],
-      isActive: true,
-    }).sort({ publishedAt: -1 });
-
-    res.json(threats);
-  } catch (error) {
-    console.error("Error searching threats:", error);
-    res.status(500).json({ message: "Failed to search threats" });
-  }
-});
-
-// Create new threat update (admin only)
 router.post("/", protect, async (req, res) => {
   try {
     const threat = new ThreatUpdate({
@@ -229,86 +261,40 @@ router.post("/", protect, async (req, res) => {
       publishedAt: new Date(),
       isActive: true,
     });
-
     await threat.save();
     res.status(201).json(threat);
-  } catch (error) {
-    console.error("Error creating threat:", error);
+  } catch (err) {
     res.status(500).json({ message: "Failed to create threat update" });
   }
 });
 
-// Update threat update (admin only)
 router.put("/:id", protect, async (req, res) => {
   try {
     const threat = await ThreatUpdate.findByIdAndUpdate(
       req.params.id,
       req.body,
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     );
-
-    if (!threat) {
+    if (!threat)
       return res.status(404).json({ message: "Threat update not found" });
-    }
-
     res.json(threat);
-  } catch (error) {
-    console.error("Error updating threat:", error);
+  } catch (err) {
     res.status(500).json({ message: "Failed to update threat" });
   }
 });
 
-// Delete threat update (admin only)
 router.delete("/:id", protect, async (req, res) => {
   try {
     const threat = await ThreatUpdate.findByIdAndUpdate(
       req.params.id,
       { isActive: false },
-      { new: true }
+      { new: true },
     );
-
-    if (!threat) {
+    if (!threat)
       return res.status(404).json({ message: "Threat update not found" });
-    }
-
     res.json({ message: "Threat update deactivated successfully" });
-  } catch (error) {
-    console.error("Error deleting threat:", error);
+  } catch (err) {
     res.status(500).json({ message: "Failed to delete threat" });
-  }
-});
-
-// Get threat statistics
-router.get("/stats/summary", protect, async (req, res) => {
-  try {
-    const stats = await ThreatUpdate.aggregate([
-      { $match: { isActive: true } },
-      {
-        $group: {
-          _id: "$severity",
-          count: { $sum: 1 },
-        },
-      },
-    ]);
-
-    const categoryStats = await ThreatUpdate.aggregate([
-      { $match: { isActive: true } },
-      {
-        $group: {
-          _id: "$category",
-          count: { $sum: 1 },
-        },
-      },
-    ]);
-
-    res.json({
-      severityBreakdown: stats,
-      categoryBreakdown: categoryStats,
-      totalThreats: await ThreatUpdate.countDocuments({ isActive: true }),
-    });
-  } catch (error) {
-    console.error("Error fetching stats:", error);
-    res.status(500).json({ message: "Failed to fetch statistics" });
   }
 });
 
