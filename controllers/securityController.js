@@ -683,14 +683,7 @@ const getSecurityLevel = (score) => {
 // Transport(20) Headers(15) AppSec(25) TechRisk(15)
 // Infra(10) Reputation(10) Config(5)
 // ════════════════════════════════════════════════════════════
-const calculateScore = (
-  allFindings,
-  sslGrade,
-  hasSSL,
-  headerData,
-  reputation,
-) => {
-  // deduct must be first — everything below uses it
+const calculateScore = (allFindings, sslGrade, hasSSL, headerData, reputation) => {
   const deduct = (findings, map) =>
     findings.reduce((s, f) => s + (map[f.severity] || 0), 0);
 
@@ -707,69 +700,61 @@ const calculateScore = (
   // Transport (20)
   if (hasSSL) {
     const pts = {
-      "A+": 20,
-      A: 17,
-      "A-": 15,
-      B: 12,
-      C: 8,
-      D: 4,
-      F: 1,
-      T: 2,
-      "N/A": 6,
+      "A+": 20, A: 17, "A-": 15, B: 12, C: 8, D: 4, F: 1, T: 2, "N/A": 5,
     };
-    breakdown.transportSecurity = pts[sslGrade] ?? 6;
+    breakdown.transportSecurity = pts[sslGrade] ?? 5;
   } else {
     breakdown.transportSecurity = 0;
   }
 
   // Headers (15)
   breakdown.headerSecurity = Math.round(
-    (headerData.presentHeaders.length / 7) * 15,
+    (headerData.presentHeaders.length / 7) * 15
   );
 
-  // App Security (25) — penalises header findings too
-  const headerFindings = allFindings.filter(
-    (f) => f.category === "Header Security",
-  );
-  const appFindings = allFindings.filter(
-    (f) => f.category === "Application Security",
-  );
+  // App Security (25)
+  // Header findings penalise this bucket — missing HSTS/CSP/X-Frame are app-layer risks
+  const headerFindings = allFindings.filter((f) => f.category === "Header Security");
+  const appFindings = allFindings.filter((f) => f.category === "Application Security");
+
   const headerAppPenalty = deduct(headerFindings, {
-    critical: 4,
-    high: 3,
-    medium: 1,
-    low: 0,
+    critical: 5, high: 4, medium: 2, low: 1, // ← increased from 4/3/1/0
   });
+
   breakdown.applicationSecurity = Math.max(
     0,
-    25 -
-      deduct(appFindings, { critical: 12, high: 8, medium: 4, low: 2 }) -
-      headerAppPenalty,
+    25 - deduct(appFindings, { critical: 12, high: 8, medium: 4, low: 2 })
+       - headerAppPenalty
   );
 
   // Tech Risk (15)
+  // WordPress version disclosure is a real risk — increase medium penalty
   breakdown.technologyRisk = Math.max(
     0,
-    15 -
-      deduct(
-        allFindings.filter((f) => f.category === "Technology Risk"),
-        { critical: 8, high: 6, medium: 3, low: 1 },
-      ),
+    15 - deduct(
+      allFindings.filter((f) => f.category === "Technology Risk"),
+      { critical: 8, high: 6, medium: 5, low: 2 } // ← medium increased from 3 to 5
+    )
   );
 
   // Infrastructure (10)
+  // If any tech version is publicly disclosed, infrastructure is not clean
+  const hasVersionDisclosure = allFindings.some(
+    (f) => f.category === "Technology Risk" && f.type === "confirmed"
+  );
+  const infraPenalty = deduct(
+    allFindings.filter((f) => f.category === "Infrastructure Exposure"),
+    { critical: 6, high: 4, medium: 2, low: 1 }
+  );
+  // Deduct 3 extra if CMS/tech version is publicly visible
   breakdown.infrastructureExposure = Math.max(
     0,
-    10 -
-      deduct(
-        allFindings.filter((f) => f.category === "Infrastructure Exposure"),
-        { critical: 6, high: 4, medium: 2, low: 1 },
-      ),
+    10 - infraPenalty - (hasVersionDisclosure ? 3 : 0)
   );
 
   // Reputation (10)
   const confirmedHighCount = allFindings.filter(
-    (f) => f.type === "confirmed" && ["critical", "high"].includes(f.severity),
+    (f) => f.type === "confirmed" && ["critical", "high"].includes(f.severity)
   ).length;
 
   if (reputation === "Warning") {
@@ -777,7 +762,7 @@ const calculateScore = (
   } else if (reputation === "Unknown") {
     breakdown.threatReputation = 4;
   } else {
-    breakdown.threatReputation = confirmedHighCount >= 4 ? 6 : 10;
+    breakdown.threatReputation = confirmedHighCount >= 3 ? 5 : 10; // ← threshold lowered from 4 to 3
   }
 
   // Config Hygiene (5)
@@ -788,7 +773,7 @@ const calculateScore = (
 
   const total = Math.min(
     100,
-    Math.round(Object.values(breakdown).reduce((a, b) => a + b, 0)),
+    Math.round(Object.values(breakdown).reduce((a, b) => a + b, 0))
   );
   return { total, breakdown };
 };
